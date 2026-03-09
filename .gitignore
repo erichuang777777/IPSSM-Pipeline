@@ -1,0 +1,23 @@
+# Sensitive data files (DO NOT upload)
+IPSSM_FJHUcohort.xlsx
+IPSSM_validation_result.xlsx
+
+# Pipeline output (intermediate/results)
+*_cleaned.csv
+*_r_output.csv
+*_results.xlsx
+*_screening_log.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
