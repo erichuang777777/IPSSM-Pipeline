@@ -132,7 +132,7 @@ def main():
     st.set_page_config(page_title="IPSS-M 批次計算工具", layout="wide", page_icon="🧬")
 
     st.title("🧬 IPSS-M 批次計算工具 (雙引擎版)")
-    st.caption("👨‍⚕️ Developed by: **輔仁大學附設醫院 (Fu Jen Catholic University Hospital, FJUH) 團隊** | ⚙️ Powered by: MSKCC IPSS-M Engine")
+    st.caption("👨‍⚕️ Developed by: **erichuang777777** | ⚙️ Powered by: MSKCC IPSS-M Engine")
 
     st.markdown("""
     本工具提供兩種計算 IPSS-M 風險評分的引擎：

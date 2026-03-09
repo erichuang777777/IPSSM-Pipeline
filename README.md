@@ -96,7 +96,7 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 ---
 
 **開發單位聲明**:
-本批次自動化流水線 (IPSSM-Pipeline) 及視覺化網頁由 **輔仁大學附設醫院 (Fu Jen Catholic University Hospital, FJUH) 研究團隊** 客製開發，並串接採用 [MSKCC IPSS-M 官方核心引擎與套件](https://mds-risk-model.com/)。
+本批次自動化流水線 (IPSSM-Pipeline) 及視覺化網頁由 **erichuang777777** 開發，並串接採用 [MSKCC IPSS-M 官方核心引擎與套件](https://mds-risk-model.com/)。
 
 **最後更新**: 2026-03-10  
 **參考文獻**: Greenberg et al., Blood (2022) — IPSS-M: Revised International Scoring System for MDS
