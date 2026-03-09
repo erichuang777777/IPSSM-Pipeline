@@ -132,6 +132,8 @@ def main():
     st.set_page_config(page_title="IPSS-M 批次計算工具", layout="wide", page_icon="🧬")
 
     st.title("🧬 IPSS-M 批次計算工具 (雙引擎版)")
+    st.caption("👨‍⚕️ Developed by: **輔仁大學附設醫院 (Fu Jen Catholic University Hospital, FJUH) 團隊** | ⚙️ Powered by: MSKCC IPSS-M Engine")
+
     st.markdown("""
     本工具提供兩種計算 IPSS-M 風險評分的引擎：
     1. **R 模型引擎 (支援遺失資料)**：使用官方 R 套件，支援情境分析 (Scenario Analysis)，能處理 **缺少細胞遺傳學 (CYTO_IPSSR)** 的資料！
@@ -139,6 +141,12 @@ def main():
     """)
 
     engine = st.radio("⚙️ 選擇計算引擎", ["1️⃣ R 模型引擎 (推薦，支援所有的資料缺失處理)", "2️⃣ 官方 Web API (速度快，但 CYTO_IPSSR 不可空白)"])
+
+    st.markdown("---")
+    st.subheader("⚠️ 法律與合規確認")
+    st.info("根據 MSKCC 官方 IPSS-M 使用條款規定，您必須同意以下事項才能執行計算：")
+    agree_terms = st.checkbox("✅ 我同意接受 IPSS-M 官方使用條款，並確認：(1) 資料已去識別化且不含病患個資 (PHI)；(2) 計算結果僅供「學術研究」使用，絕不直接應用於臨床診斷、治療或醫療報告。")
+    st.markdown("---")
 
     uploaded_file = st.file_uploader("📂 選擇包含資料的 Excel 檔案 (.xlsx) 或 CSV 檔案", type=["xlsx", "csv"])
 
@@ -155,7 +163,10 @@ def main():
             with st.expander("👀 預覽前 3 筆原始資料"):
                 st.dataframe(raw_df.head(3))
             
-            if st.button("🚀 開始計算 IPSS-M", type="primary"):
+            if not agree_terms:
+                st.warning("請先勾選上方的「法律與合規確認」同意書，按鈕才會解鎖。")
+            
+            if st.button("🚀 開始計算 IPSS-M", type="primary", disabled=not agree_terms):
                 # ==========================================
                 # Engine 1: 呼叫本地/雲端 R 引擎 (ipssm_pipeline.py)
                 # ==========================================
