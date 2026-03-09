@@ -4,7 +4,7 @@ IPSSM Pipeline - 一鍵完成資料驗證 + R 風險計算 + 結果整合
 合併自 screener_v2.py 和 translator_v3.py
 
 用法:
-  python ipssm_pipeline.py IPSSM_FJHUcohort.xlsx          # 一鍵全流程
+  python ipssm_pipeline.py data.xlsx          # 一鍵全流程
   python ipssm_pipeline.py data.csv --screen-only          # 僅執行資料驗證
   python ipssm_pipeline.py cleaned.csv --translate-only    # 僅執行 R 計算
   python ipssm_pipeline.py data.xlsx -v validation.xlsx    # 指定驗證檔案比對
@@ -218,12 +218,12 @@ def _read_input_file(input_path):
 
 
 def _convert_fjuh_format(rows, fieldnames, report):
-    """偵測並轉換 FJUH 格式（欄名尾部空格）"""
+    """偵測並修復欄名尾部空格格式"""
     has_fjuh = any(col.endswith(' ') for col in fieldnames)
     if not has_fjuh:
         return rows
 
-    print("  偵測到 FJUH 格式（欄名有尾部空格），自動轉換中...")
+    print("  偵測到異常格式（欄名有尾部空格），自動修復中...")
     mapping = {}
     for col in fieldnames:
         clean_col = col.strip()
@@ -563,7 +563,7 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 def main():
     parser = argparse.ArgumentParser(
         description='IPSSM Pipeline - 一鍵完成資料驗證 + R 風險計算',
-        epilog='支援 CSV 和 Excel 輸入，自動轉換 FJUH 格式。'
+        epilog='支援 CSV 和 Excel 輸入，自動修復異常空格格式。'
     )
     parser.add_argument('input_file', help='輸入檔案（CSV 或 Excel）')
     parser.add_argument('-v', '--validation', help='手動驗證結果 Excel 檔案（比對用）')

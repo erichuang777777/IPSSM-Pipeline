@@ -6,7 +6,7 @@
 
 ```bash
 # 一鍵全流程（驗證 → R 計算 → Excel 結果）
-python ipssm_pipeline.py IPSSM_FJHUcohort.xlsx
+python ipssm_pipeline.py data.xlsx
 
 # 分步驟
 python ipssm_pipeline.py data.xlsx --screen-only      # 僅驗證
@@ -23,7 +23,7 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
     │
     ▼
 [階段 1] 資料驗證 & 格式轉換
-    ├─ 自動偵測 FJUH 格式（欄名空格修復）
+    ├─ 自動偵測並修復欄名異常空格
     ├─ 必填欄位檢查 (HB, PLT, BM_BLAST)
     ├─ NA 標準化 & 數值範圍驗證
     ├─ 產出: *_cleaned.csv + *_screening_log.txt
@@ -63,7 +63,6 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 ├── MISSING_DATA_HANDLING.md        # 缺失數據處理說明
 │
 ├── 1.IPSSMexample.csv              # 官方範例數據 (3 patients)
-├── IPSSM_FJHUcohort.xlsx           # FJUH 隊列原始數據
 ├── IPSSM_validation_result.xlsx    # 手動驗證結果
 │
 └── [執行後自動產生]
@@ -72,15 +71,6 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
     ├── *_results.xlsx              # 最終 Excel 結果
     └── *_screening_log.txt         # 驗證日誌
 ```
-
-## FJUH 隊列結果
-
-| 項目 | 數值 |
-|------|------|
-| 輸入患者 | 356 |
-| 通過驗證 | 355（1 人因缺少 PLT 被跳過） |
-| CONFIDENT | 248 (69.9%) |
-| UNCERTAIN | 107 (30.1%) |
 
 ## 故障排除
 

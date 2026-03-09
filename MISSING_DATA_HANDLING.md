@@ -80,7 +80,7 @@ ELSE (ΔRisk > 1):
     (insufficient data to provide reliable single classification)
 ```
 
-## Real-World Example from FJUH Cohort
+## Real-World Example
 
 ### Patient ID: 3113041
 - Missing: CYTO_IPSSR, some gene mutations
@@ -158,15 +158,6 @@ PHF6, PPM1D, PRPF8, PTPN11, SETBP1, STAG2, WT1
 - Hemoglobin (HB)
 - Platelet count (PLT)
 - Bone marrow blast percentage (BM_BLAST)
-
-## Summary for FJUH Cohort Results
-
-- **Total Patients**: 355
-- **CONFIDENT Results**: 248 patients (69.9%)
-  - Have sufficient data; results are definitive
-- **UNCERTAIN Results**: 107 patients (30.1%)
-  - Missing key data; results should be interpreted cautiously
-  - Could benefit from follow-up testing
 
 ## References
 

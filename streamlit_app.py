@@ -38,7 +38,7 @@ def clean_data_for_api(raw_df):
     report = ValidationReport()
     raw_df = raw_df.astype(str)
     
-    # 偵測 FJUH 格式
+    # 偵測並修復欄名尾部空格
     mapping = {col: col.strip() for col in raw_df.columns if col != col.strip()}
     if mapping:
         raw_df = raw_df.rename(columns=mapping)
@@ -134,7 +134,7 @@ def main():
     st.title("🧬 IPSS-M 批次計算工具 (雙引擎版)")
     st.markdown("""
     本工具提供兩種計算 IPSS-M 風險評分的引擎：
-    1. **R 模型引擎 (支援遺失資料)**：使用官方 R 套件，支援情境分析 (Scenario Analysis)，能處理 **缺少細胞遺傳學 (CYTO_IPSSR)** 的資料 (如 FJUH cohort)！
+    1. **R 模型引擎 (支援遺失資料)**：使用官方 R 套件，支援情境分析 (Scenario Analysis)，能處理 **缺少細胞遺傳學 (CYTO_IPSSR)** 的資料！
     2. **Web API 引擎 (輕量極速)**：使用官方 REST API，但 **嚴格要求** 必須提供 `CYTO_IPSSR`，若空白會直接報錯 `Error 400`。
     """)
 
