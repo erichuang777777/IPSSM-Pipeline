@@ -22,6 +22,9 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
+# Import cohort converter for handling multiple cohort formats
+from cohort_converter import detect_cohort_type, find_column_mapping, STANDARD_IPSSM_COLUMNS
+
 # ============================================================================
 #  常數定義
 # ============================================================================
@@ -219,6 +222,65 @@ def _read_input_file(input_path):
     return rows, fieldnames
 
 
+def _try_convert_cohort(input_path, report):
+    """
+    Attempt to convert input file to standard IPSSM format.
+    Returns:
+        - (rows, fieldnames, needs_conversion) if conversion applied
+        - (rows, fieldnames, False) if already in standard format
+    """
+    try:
+        # Read input file as dataframe
+        input_path = Path(input_path)
+        if input_path.suffix.lower() == '.xlsx':
+            df = pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
+        else:
+            df = pd.read_csv(input_path, dtype=str, keep_default_na=False)
+        
+        # Detect cohort type
+        cohort_type = detect_cohort_type(df)
+        
+        # Find column mapping
+        mapping = find_column_mapping(df)
+        
+        # Check if conversion is needed (not all input columns are in standard format)
+        is_standard = len(mapping) == len(df.columns) and set(mapping.values()) == set(df.columns)
+        
+        if cohort_type != "UNKNOWN" and not is_standard:
+            print(f"\n  [COHORT DETECTION] Detected format: {cohort_type}")
+            print(f"  [COLUMN MAPPING] Found {len(mapping)}/{len(df.columns)} matching columns")
+            
+            # Apply column mapping
+            df_converted = df.rename(columns=mapping)
+            
+            # Add missing columns with NA
+            missing_cols = set(STANDARD_IPSSM_COLUMNS) - set(df_converted.columns)
+            if missing_cols:
+                print(f"  [MISSING COLUMNS] Adding {len(missing_cols)} missing columns: {', '.join(sorted(missing_cols)[:5])}{'...' if len(missing_cols) > 5 else ''}")
+                for col in missing_cols:
+                    df_converted[col] = 'NA'
+            
+            # Reorder to standard format
+            df_converted = df_converted[STANDARD_IPSSM_COLUMNS]
+            
+            # Convert back to rows/fieldnames format
+            rows = df_converted.to_dict('records')
+            fieldnames = list(df_converted.columns)
+            
+            report.add_conversion(f"Cohort type '{cohort_type}'", "Standard IPSSM format")
+            return rows, fieldnames, True
+        
+        # Already in standard format or unknown format
+        rows, fieldnames = _read_input_file(input_path)
+        return rows, fieldnames, False
+        
+    except Exception as e:
+        print(f"  [CONVERSION WARNING] Could not auto-detect cohort format: {e}")
+        # Fall back to regular input reading
+        rows, fieldnames = _read_input_file(input_path)
+        return rows, fieldnames, False
+
+
 def _convert_fjuh_format(rows, fieldnames, report):
     """偵測並修復欄名尾部空格格式"""
     has_fjuh = any(col.endswith(' ') for col in fieldnames)
@@ -311,7 +373,11 @@ def run_screening(input_path, output_path, log_path):
     valid_rows = []
 
     try:
-        rows, fieldnames = _read_input_file(input_path)
+        # Try to convert cohort format first
+        rows, fieldnames, converted = _try_convert_cohort(input_path, report)
+        if converted:
+            print(f"  [OK] Successfully converted to standard IPSSM format\n")
+        
         report.input_cols = len(fieldnames)
         report.input_rows = len(rows)
 
@@ -344,12 +410,12 @@ def run_screening(input_path, output_path, log_path):
             f.write("=" * 70 + "\n")
             f.write(report_text)
 
-        print(f"  ✓ Cleaned CSV: {output_path}")
-        print(f"  ✓ 驗證日誌:    {log_path}")
+        print(f"  [OK] Cleaned CSV: {output_path}")
+        print(f"  [OK] 驗證日誌:    {log_path}")
         return len(report.errors) == 0
 
     except Exception as e:
-        print(f"  ✗ ERROR: {e}")
+        print(f"  [ERROR] ERROR: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -487,7 +553,7 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
     input_path = Path(input_csv)
     rscript = rscript_path or _find_rscript()
     if not rscript:
-        print("  ✗ ERROR: 找不到 Rscript！請安裝 R >= 4.3.0")
+        print("  [ERROR] ERROR: 找不到 Rscript！請安裝 R >= 4.3.0")
         return False
 
     output_dir = input_path.parent
@@ -522,13 +588,13 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
             print("  [STDERR]:", result.stderr)
 
         if result.returncode != 0:
-            print("  ✗ ERROR: R 執行失敗")
+            print("  [ERROR] ERROR: R 執行失敗")
             with open(output_dir / "r_error.log", "w", encoding="utf-8") as f:
                 f.write(result.stderr or "No stderr output recorded.")
             return False
 
         if not r_output_csv.exists():
-            print("  ✗ ERROR: R 輸出檔案未產生")
+            print("  [ERROR] ERROR: R 輸出檔案未產生")
             return False
 
         # 處理結果
@@ -549,7 +615,7 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 
         _save_excel(r_results, excel_output, validation_data)
 
-        print(f"  ✓ 結果已儲存: {excel_output}")
+        print(f"  [OK] 結果已儲存: {excel_output}")
         print(f"    Sheet 'Summary':       ID + Confidence_Level")
         print(f"    Sheet 'R_Full_Output':  完整 R 計算數據")
         if validation_data:
@@ -593,7 +659,7 @@ def main():
     if args.translate_only:
         success = run_translation(str(input_path), args.rscript, validation_path)
         print(f"\n{'='*60}")
-        print(f"  完成！{'✓ 成功' if success else '✗ 失敗'}")
+        print(f"  完成！{'[OK] 成功' if success else '[ERROR] 失敗'}")
         print(f"{'='*60}")
         sys.exit(0 if success else 1)
 
@@ -604,7 +670,7 @@ def main():
     screen_ok = run_screening(input_path, cleaned_csv, log_path)
 
     if not screen_ok:
-        print("\n  ✗ 驗證階段有錯誤，請檢查日誌。")
+        print("\n  [ERROR] 驗證階段有錯誤，請檢查日誌。")
         sys.exit(1)
 
     # === 僅驗證模式 ===
@@ -618,7 +684,7 @@ def main():
     translate_ok = run_translation(str(cleaned_csv), args.rscript, validation_path)
 
     print(f"\n{'='*60}")
-    print(f"  Pipeline 完成！{'✓ 全部成功' if translate_ok else '✗ R 計算失敗'}")
+    print(f"  Pipeline 完成！{'[OK] 全部成功' if translate_ok else '[ERROR] R 計算失敗'}")
     print(f"{'='*60}")
     sys.exit(0 if translate_ok else 1)
 
