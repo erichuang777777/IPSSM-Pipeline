@@ -522,6 +522,8 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 
         if result.returncode != 0:
             print("  ✗ ERROR: R 執行失敗")
+            with open(output_dir / "r_error.log", "w", encoding="utf-8") as f:
+                f.write(result.stderr or "No stderr output recorded.")
             return False
 
         if not r_output_csv.exists():

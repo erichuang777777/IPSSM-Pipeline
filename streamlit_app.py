@@ -142,6 +142,25 @@ def main():
 
     engine = st.radio("⚙️ 選擇計算引擎", ["1️⃣ R 模型引擎 (推薦，支援所有的資料缺失處理)", "2️⃣ 官方 Web API (速度快，但 CYTO_IPSSR 不可空白)"])
 
+    @st.cache_resource(show_spinner="⏳ 正在初始化雲端 R 執行環境與 IPSSM 核心套件 (⚠️ 伺服器初次部署時約需花費 3~5 分鐘安裝，請耐心等待...)")
+    def setup_r_environment():
+        rscript = "Rscript" if os.name == "posix" else _find_rscript()
+        if rscript:
+            try:
+                # 檢查是否已安裝 ipssm
+                check_cmd = [rscript, "-e", "if(!require('ipssm')) quit(status=1)"]
+                if subprocess.run(check_cmd).returncode == 0:
+                    return True
+                # 若未安裝，呼叫安裝腳本
+                result = subprocess.run([rscript, "install.R"], capture_output=True, text=True)
+                if result.returncode != 0:
+                    st.toast(f"R 套件安裝失敗：\n{result.stderr}", icon="❌")
+                    return False
+                return True
+            except Exception as e:
+                return False
+        return False
+
     st.markdown("---")
     st.subheader("⚠️ 法律與合規確認")
     st.info("根據 MSKCC 官方 IPSS-M 使用條款規定，您必須同意以下事項才能執行計算：")
@@ -189,6 +208,12 @@ def main():
                         log_path = base_name + "_screening_log.txt"
                         excel_output = base_name + "_results.xlsx"
                         
+                        # 0. 確認 R 環境
+                        setup_success = setup_r_environment()
+                        if not setup_success:
+                            st.error("R 環境或核心套件安裝失敗！無法執行 R 引擎。")
+                            return
+
                         # 1. 執行 Screening
                         success_screen = run_screening(tmp_in_path, cleaned_csv, log_path)
                         if not success_screen:
@@ -232,7 +257,14 @@ def main():
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                 )
                         else:
-                            st.error("R 計算失敗！可能是資料型態錯誤，或是 R 套件尚未安裝完畢。")
+                            err_msg = "未知錯誤"
+                            err_log = os.path.join(os.path.dirname(excel_output), "r_error.log")
+                            if os.path.exists(err_log):
+                                with open(err_log, "r", encoding="utf-8") as f:
+                                    err_msg = f.read()
+                            st.error(f"R 計算失敗！可能是資料型態錯誤，或是 R 套件尚未安裝完畢。")
+                            with st.expander("查看 R 引擎錯誤日誌 (給開發者)"):
+                                st.code(err_msg, language="r")
                             
                 # ==========================================
                 # Engine 2: 呼叫 API
