@@ -160,8 +160,11 @@ def main():
                 raw_df = pd.read_excel(uploaded_file)
                 
             st.success(f"檔案上傳成功！共 {len(raw_df)} 筆資料。")
-            with st.expander("👀 預覽前 3 筆原始資料"):
-                st.dataframe(raw_df.head(3))
+            with st.expander("👀 預覽前 3 筆原始資料 (為保護隱私已隱藏 ID 欄位)"):
+                preview_df = raw_df.copy()
+                if 'ID' in preview_df.columns:
+                    preview_df = preview_df.drop(columns=['ID'])
+                st.dataframe(preview_df.head(3))
             
             if not agree_terms:
                 st.warning("請先勾選上方的「法律與合規確認」同意書，按鈕才會解鎖。")

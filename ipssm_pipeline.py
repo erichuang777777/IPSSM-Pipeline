@@ -207,6 +207,7 @@ class ValidationReport:
 
 def _read_input_file(input_path):
     """讀取 CSV 或 Excel 檔案，回傳 (rows_list, fieldnames)"""
+    input_path = Path(input_path)
     if input_path.suffix.lower() == '.xlsx':
         df = pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
         return df.to_dict('records'), list(df.columns)
