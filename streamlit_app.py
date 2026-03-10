@@ -154,8 +154,21 @@ def main():
             env = os.environ.copy()
             env["R_LIBS_USER"] = user_r_lib
 
-            # 檢查 ipssm 是否已安裝
-            check_cmd = [rscript, "-e", "library(ipssm)"]
+            # 檢查 ipssm 是否已安裝 (包含雲端與本地路徑)
+            check_script = """
+            lib_candidates <- c(
+              path.expand("~/R/library"),
+              path.expand("~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5"),
+              path.expand("~/AppData/Local/R/win-library/4.5"),
+              "C:/Users/user/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5",
+              "C:/Users/user/AppData/Local/R/win-library/4.5"
+            )
+            for (lib_path in lib_candidates) {
+              if (dir.exists(lib_path)) .libPaths(c(lib_path, .libPaths()))
+            }
+            if (!require('ipssm', quietly=TRUE)) quit(status=1)
+            """
+            check_cmd = [rscript, "-e", check_script]
             if subprocess.run(check_cmd, env=env, capture_output=True).returncode == 0:
                 return True
 
@@ -215,7 +228,10 @@ def main():
                         base_name = os.path.splitext(tmp_in_path)[0]
                         cleaned_csv = base_name + "_cleaned.csv"
                         log_path = base_name + "_screening_log.txt"
-                        excel_output = base_name + "_results.xlsx"
+                        
+                        # run_translation 以 cleaned_csv 為輸入，檔案名自帶 _cleaned 
+                        # 因此最後輸出會多一層 _cleaned，例如：_cleaned_results.xlsx
+                        excel_output = base_name + "_cleaned_results.xlsx"
                         
                         # 0. 確認 R 環境
                         setup_success = setup_r_environment()
@@ -255,7 +271,10 @@ def main():
                             col2.metric("CONFIDENT (可靠)", f"{confident} 筆")
                             col3.metric("UNCERTAIN (不確定)", f"{uncertain} 筆")
                             
-                            st.dataframe(summary_df.head(5))
+                            preview_out_1 = summary_df.copy()
+                            if 'ID' in preview_out_1.columns:
+                                preview_out_1 = preview_out_1.drop(columns=['ID'])
+                            st.dataframe(preview_out_1.head(5))
                             
                             # 供下載
                             with open(excel_output, "rb") as f:
@@ -298,8 +317,11 @@ def main():
                         if err_count > 0:
                             st.error(f"❌ 警告：有 {err_count} 筆資料因為缺少 `CYTO_IPSSR`，遭官方 API 拒絕計算 (Error 400)。若要計算這類資料，強烈建議使用『R 模型引擎』！")
                         
-                        st.write("預覽 5 筆摘要結果：")
-                        st.dataframe(summary_df.head(5))
+                        st.write("預覽 5 筆摘要結果 (為保護隱私已隱藏 ID 欄位)：")
+                        preview_out_2 = summary_df.copy()
+                        if 'ID' in preview_out_2.columns:
+                            preview_out_2 = preview_out_2.drop(columns=['ID'])
+                        st.dataframe(preview_out_2.head(5))
                         
                         output = io.BytesIO()
                         with pd.ExcelWriter(output, engine='openpyxl') as writer:
