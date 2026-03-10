@@ -23,7 +23,8 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
     │
     ▼
 [階段 1] 資料驗證 & 格式轉換
-    ├─ 自動偵測並修復欄名異常空格
+    ├─ 自動偵測隊列格式 (FJUH / HSCT / 自訂)
+    ├─ 自動解析核型字符串 (Karyotype → 細胞遺傳學欄位)
     ├─ 必填欄位檢查 (HB, PLT, BM_BLAST)
     ├─ NA 標準化 & 數值範圍驗證
     ├─ 產出: *_cleaned.csv + *_screening_log.txt
@@ -48,28 +49,31 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 | Range < 1 | **CONFIDENT** ✅ | 缺失數據影響小，Mean 分數可信 |
 | Range ≥ 1 | **UNCERTAIN** ⚠️ | 缺失關鍵數據，結果跨多個風險類別 |
 
-> 詳見 [MISSING_DATA_HANDLING.md](MISSING_DATA_HANDLING.md) 了解三情景計算與信心判定的完整數學基礎。
+> 詳見 [SCREENER_REFERENCE.md](SCREENER_REFERENCE.md) 了解完整欄位規格、函數說明、與核型解析規則。
 
 ## 環境需求
 
 - **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`）
 - **R** ≥ 4.3.0（需安裝 `ipssm` 套件）
 
-## 檔案結構
+## 專案結構
 
 ```
-├── ipssm_pipeline.py              # 唯一核心腳本
-├── README.md                       # 本文件
-├── MISSING_DATA_HANDLING.md        # 缺失數據處理說明
+├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
+├── streamlit_app.py           # Streamlit 網頁介面
+├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
+├── README.md                  # 本文件
 │
-├── 1.IPSSMexample.csv              # 官方範例數據 (3 patients)
-├── IPSSM_validation_result.xlsx    # 手動驗證結果
+├── install.R                  # Streamlit Cloud R 安裝腳本
+├── packages.txt               # Streamlit Cloud apt 依賴
+├── requirements.txt           # Python 依賴
+├── .gitignore                 # Git 忽略規則
 │
-└── [執行後自動產生]
-    ├── *_cleaned.csv               # 清理後 CSV
-    ├── *_r_output.csv              # R 計算中間輸出
-    ├── *_results.xlsx              # 最終 Excel 結果
-    └── *_screening_log.txt         # 驗證日誌
+├── 1.IPSSMexample.csv         # 官方範例數據 (3 patients)
+└── backup/                    # 原始測試數據備份
+    ├── IPSSM_FJHUcohort.xlsx
+    ├── HSCT cohort.xlsx
+    └── IPSSM_validation_result.xlsx
 ```
 
 ## 故障排除
@@ -78,7 +82,8 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 |------|------|
 | "Missing required field" | 患者缺少 HB/PLT/BM_BLAST，檢查原始數據 |
 | "R execution failed" | 確認 R ≥ 4.3.0 且已安裝 `ipssm` 套件 |
-| 大量 UNCERTAIN 結果 | 正常（缺少細胞遺傳學數據），詳見 MISSING_DATA_HANDLING.md |
+| 大量 UNCERTAIN 結果 | 正常（缺少細胞遺傳學數據），詳見 SCREENER_REFERENCE.md |
+| "Invalid category: CYTO_IPSSR" | CYTO_IPSSR 必須為 Very Good/Good/Intermediate/Poor/Very Poor |
 
 ## 法律與合規注意事項 (Terms of Use / Compliance)
 
@@ -89,14 +94,12 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 2. **🚫 禁止傳輸病患個資 (PHI/PII)**：
    不得上傳含有「真實姓名」、「身分證字號」等足資辨識個人身分的Protected Health Information (PHI)。系統會自動過濾 `ID` 欄位不傳送至國外伺服器以保護隱私，但其餘欄位請確保皆已去識別化。
 3. **🚫 禁止商業用途**：
-   嚴格禁止將此工具或產生之結果用於任何商業目的（如販售、授權、商業藥廠試驗），除非已取得 MSK之明示書面授權。
+   嚴格禁止將此工具或產生之結果用於任何商業目的，除非已取得 MSK 之明示書面授權。
 4. **⚠️ 發表論文限制**：
    若使用此批次計算工具產出學術論文或期刊報告，事前應先發信至 `papaemme@mskcc.org` 尋求授權許可並妥善引用原作者權益。
 
 ---
 
-**開發單位聲明**:
-本批次自動化流水線 (IPSSM-Pipeline) 及視覺化網頁由 **erichuang777777** 開發，並串接採用 [MSKCC IPSS-M 官方核心引擎與套件](https://mds-risk-model.com/)。
-
+**開發者**: erichuang777777 | ⚙️ Powered by: [MSKCC IPSS-M Engine](https://mds-risk-model.com/)  
 **最後更新**: 2026-03-10  
-**參考文獻**: Greenberg et al., Blood (2022) — IPSS-M: Revised International Scoring System for MDS
+**參考文獻**: Bernard et al., NEJM Evid (2022) — IPSS-M

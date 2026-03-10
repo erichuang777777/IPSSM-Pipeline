@@ -1,12 +1,12 @@
-# Sensitive data files (DO NOT upload)
-IPSSM_FJHUcohort.xlsx
-IPSSM_validation_result.xlsx
+# Backup data (raw data, keep locally only)
+backup/
 
 # Pipeline output (intermediate/results)
 *_cleaned.csv
 *_r_output.csv
 *_results.xlsx
 *_screening_log.txt
+r_error.log
 
 # Python
 __pycache__/

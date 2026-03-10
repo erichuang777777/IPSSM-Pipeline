@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 """
 IPSSM Pipeline - 一鍵完成資料驗證 + R 風險計算 + 結果整合
-合併自 screener_v2.py 和 translator_v3.py
+
+整合了：
+  - Cohort Converter: 自動偵測並轉換不同醫院/研究隊列的欄位格式
+  - Karyotype Parser: 自動解析核型字符串為 IPSS-M 細胞遺傳學欄位
+  - Screener: 資料驗證、NA 標準化、數值範圍檢查
+  - Translator: 呼叫 R IPSSMwrapper 執行三情境分析並標記信心等級
 
 用法:
-  python ipssm_pipeline.py data.xlsx          # 一鍵全流程
-  python ipssm_pipeline.py data.csv --screen-only          # 僅執行資料驗證
-  python ipssm_pipeline.py cleaned.csv --translate-only    # 僅執行 R 計算
-  python ipssm_pipeline.py data.xlsx -v validation.xlsx    # 指定驗證檔案比對
+  python ipssm_pipeline.py data.xlsx              # 一鍵全流程
+  python ipssm_pipeline.py data.csv --screen-only  # 僅執行資料驗證
+  python ipssm_pipeline.py cleaned.csv --translate-only  # 僅執行 R 計算
+  python ipssm_pipeline.py data.xlsx -v validation.xlsx  # 指定驗證檔案比對
 """
 
 import argparse
 import csv
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,8 +29,6 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
-# Import cohort converter for handling multiple cohort formats
-from cohort_converter import detect_cohort_type, find_column_mapping, STANDARD_IPSSM_COLUMNS
 
 # ============================================================================
 #  常數定義
@@ -59,6 +64,43 @@ BINARY_FIELDS = {
     'KRAS', 'NF1', 'NPM1', 'NRAS', 'RUNX1', 'SETBP1', 'SF3B1', 'SRSF2', 'STAG2',
     'U2AF1', 'ETNK1', 'GATA2', 'GNB1', 'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'WT1'
 }
+
+# 欄位名稱別名對照表 (用於自動偵測不同醫院的欄位名稱)
+COLUMN_ALIASES = {
+    'ID':          ['ID', 'Patient_ID', 'PatientID', 'patient_id', 'PID', 'Chart No.', 'Chart_No', 'ChartNo'],
+    'HB':          ['HB', 'Hemoglobin', 'hemoglobin', 'Hb'],
+    'PLT':         ['PLT', 'Platelet', 'platelets', 'platelet_count'],
+    'BM_BLAST':    ['BM_BLAST', 'Blast', 'BM Blast', 'bone marrow blast', 'BM_Blast', 'Blast_BM', 'Blast_bm'],
+    'del5q':       ['del5q', 'del(5q)', 'DEL5Q', 'Deletion 5q'],
+    'del7_7q':     ['del7_7q', 'del(7)', 'del(7q)', 'DEL7', 'Deletion 7'],
+    'TP53loh':     ['TP53loh', 'TP53 LOH', 'TP53_LOH', 'TP53-LOH'],
+    'TP53mut':     ['TP53mut', 'TP53', 'TP53_Mutation', 'TP53 mutation'],
+    'BCOR':        ['BCOR'], 'BCORL1': ['BCORL1'], 'CEBPA': ['CEBPA'],
+    'ETNK1':       ['ETNK1'], 'GATA2': ['GATA2'], 'GNB1': ['GNB1'],
+    'IDH1':        ['IDH1'], 'NF1': ['NF1'], 'PHF6': ['PHF6'],
+    'PPM1D':       ['PPM1D'], 'PRPF8': ['PRPF8'], 'PTPN11': ['PTPN11'],
+    'SETBP1':      ['SETBP1'], 'STAG2': ['STAG2'], 'WT1': ['WT1'],
+    'FLT3':        ['FLT3', 'FLT3-ITD', 'FLT3_ITD'],
+    'MLL_PTD':     ['MLL_PTD', 'MLL-PTD', 'MLL PTD'],
+    'SF3B1_5q':    ['SF3B1_5q', 'SF3B1 5q'],
+    'NPM1':        ['NPM1'], 'RUNX1': ['RUNX1'], 'NRAS': ['NRAS'],
+    'ETV6':        ['ETV6'], 'IDH2': ['IDH2'], 'CBL': ['CBL'],
+    'EZH2':        ['EZH2'], 'U2AF1': ['U2AF1'], 'SRSF2': ['SRSF2'],
+    'DNMT3A':      ['DNMT3A'], 'ASXL1': ['ASXL1'], 'KRAS': ['KRAS'],
+    'SF3B1_alpha': ['SF3B1_alpha', 'SF3B1-alpha'],
+    'CYTO_IPSSR':  ['CYTO_IPSSR', 'CYTO_IPSS-R', 'CYTO IPSS-R', 'Cytogenetic IPSS-R'],
+    'IPSS_M_':     ['IPSS_M_', 'IPSS_M', 'IPSSM', 'IPSS-M'],
+}
+
+# cohort converter 使用的標準欄位 (42 欄，與 STANDARD_COLUMNS 略有不同排列)
+STANDARD_IPSSM_COLUMNS = [
+    'ID', 'HB', 'PLT', 'BM_BLAST', 'del5q', 'del7_7q', 'TP53loh', 'TP53mut',
+    'BCOR', 'BCORL1', 'CEBPA', 'ETNK1', 'GATA2', 'GNB1', 'IDH1', 'NF1',
+    'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'SETBP1', 'STAG2', 'WT1',
+    'FLT3', 'MLL_PTD', 'SF3B1_5q', 'NPM1', 'RUNX1', 'NRAS', 'ETV6', 'IDH2',
+    'CBL', 'EZH2', 'U2AF1', 'SRSF2', 'DNMT3A', 'ASXL1', 'KRAS', 'SF3B1_alpha',
+    'CYTO_IPSSR', 'IPSS_M_'
+]
 
 R_SCRIPT_TEMPLATE = r"""#!/usr/bin/env Rscript
 
@@ -118,6 +160,183 @@ write.csv(results, file=output_csv, row.names=FALSE, na="NA")
 cat("\n[OK] Results generated with scenario analysis and confidence indicators\n")
 """
 
+
+# ============================================================================
+#  核型解析器 (Karyotype Parser)
+#  從核型字符串 (如 "46,XY,del(5q)") 提取 IPSS-M 所需的細胞遺傳學欄位
+# ============================================================================
+
+def parse_karyotype(karyotype_str):
+    """
+    解析核型字符串，回傳 IPSS-M 所需的細胞遺傳學資訊。
+
+    參數:
+        karyotype_str: 核型字符串 (例: "46,XY,del(5q)", "47,XX,+8[17]/46,XX[3]")
+
+    回傳 dict:
+        del5q    (int): 1=有 del(5q), 0=無
+        del7_7q  (int): 1=有 -7/del(7q), 0=無
+        del17p   (int): 1=有 -17/del(17p), 0=無
+        complex  (int): 1=複雜核型(≥3異常), 0=非複雜
+        cyto_ipssr (str): 'Very Good'/'Good'/'Intermediate'/'Poor'/'Very Poor'/'NA'
+    """
+    if not karyotype_str or pd.isna(karyotype_str):
+        return {'del5q': 0, 'del7_7q': 0, 'del17p': 0, 'complex': 0, 'cyto_ipssr': 'NA'}
+
+    karyotype = str(karyotype_str).strip().upper()
+    if karyotype in ('NM', ''):
+        return {'del5q': 0, 'del7_7q': 0, 'del17p': 0, 'complex': 0, 'cyto_ipssr': 'NA'}
+
+    abn = _extract_abnormalities(karyotype)
+    is_complex = abn['abnorm_count'] >= 3
+    cyto = _classify_cytogenetics(abn, abn['has_del5q'], abn['has_del7'], abn['has_del17p'], is_complex)
+
+    return {
+        'del5q': 1 if abn['has_del5q'] else 0,
+        'del7_7q': 1 if abn['has_del7'] else 0,
+        'del17p': 1 if abn['has_del17p'] else 0,
+        'complex': 1 if is_complex else 0,
+        'cyto_ipssr': cyto,
+    }
+
+
+def _extract_abnormalities(karyotype):
+    """
+    從核型字符串中提取所有染色體異常。
+
+    偵測項目:
+      - del(5q), -7/del(7q), -17/del(17p), del(11q), del(12p), del(20q)
+      - -Y, +8, +19, i(17q), inv(3)/i(3q)
+      - 計算總異常數以判斷是否為複雜核型
+    """
+    abn = {
+        'has_del5q': False, 'has_del7': False, 'has_del17p': False, 'has_del11q': False,
+        'has_del12p': False, 'has_del20q': False, 'has_minus_y': False, 'has_plus8': False,
+        'has_plus19': False, 'has_i17q': False, 'has_inv3': False, 'has_i3q': False,
+        'has_minus7': False, 'abnorm_count': 0, 'is_normal': False,
+    }
+
+    if karyotype in ('46,XX', '46,XY'):
+        abn['is_normal'] = True
+        return abn
+
+    karyotype_clean = re.sub(r'\[\d+\]', '', karyotype)
+    abnorm_list = []
+
+    if re.search(r'DEL\(\s*5|5Q-', karyotype_clean):
+        abn['has_del5q'] = True
+        abnorm_list.append('del5q')
+    if re.search(r'^\s*-7\b|,\s*-7\b', karyotype_clean):
+        abn['has_minus7'] = abn['has_del7'] = True
+        abnorm_list.append('del7')
+    elif re.search(r'DEL\(\s*7', karyotype_clean):
+        abn['has_del7'] = True
+        abnorm_list.append('del7')
+    if re.search(r'^\s*-17\b|,\s*-17\b|DEL\(\s*17\w*P', karyotype_clean):
+        abn['has_del17p'] = True
+        abnorm_list.append('del17p')
+    elif re.search(r'I\(\s*17\s*Q', karyotype_clean):
+        abn['has_i17q'] = True
+    if re.search(r'DEL\(\s*11\w*Q', karyotype_clean):
+        abn['has_del11q'] = True
+        abnorm_list.append('del11q')
+    if re.search(r'DEL\(\s*12\w*P', karyotype_clean):
+        abn['has_del12p'] = True
+        abnorm_list.append('del12p')
+    if re.search(r'DEL\(\s*20', karyotype_clean):
+        abn['has_del20q'] = True
+        abnorm_list.append('del20q')
+    if re.search(r'^\s*-Y\b|,\s*-Y\b', karyotype_clean):
+        abn['has_minus_y'] = True
+        abnorm_list.append('-Y')
+    if re.search(r',?\s*\+8\b', karyotype_clean):
+        abn['has_plus8'] = True
+    if re.search(r',?\s*\+19\b', karyotype_clean):
+        abn['has_plus19'] = True
+    if re.search(r'INV\(\s*3|I\(\s*3', karyotype_clean):
+        abn['has_inv3'] = abn['has_i3q'] = True
+
+    other_abn = (len(re.findall(r',?\s*\+\d+', karyotype_clean))
+                 + len(re.findall(r'DEL\(', karyotype_clean))
+                 + len(re.findall(r'DUP\(|INV\(', karyotype_clean)))
+    abn['abnorm_count'] = len(abnorm_list) + max(0, other_abn - len([x for x in abnorm_list if 'del' in x]))
+    return abn
+
+
+def _classify_cytogenetics(abn, has_del5q, has_del7, has_del17p, is_complex):
+    """
+    根據 IPSS-R 標準將異常分類為細胞遺傳學風險類別。
+
+    分類規則 (依 IPSS-R):
+      Very Good: -Y, del(11q)
+      Good:      Normal, del(5q), del(12p), del(20q), 含 del(5q) 的雙異常
+      Intermediate: del(7q), +8, +19, i(17q), 其他單/雙獨立異常
+      Poor:      -7, inv(3)/i(3q)/del(3q), 含 -7/del(7q) 雙異常, 複雜(3個異常)
+      Very Poor: 複雜(>3個異常)
+    """
+    if abn['abnorm_count'] > 3:
+        return 'Very Poor'
+    if abn['has_minus_y'] or abn['has_del11q']:
+        return 'Very Good'
+    if abn['has_minus7'] or abn['has_inv3'] or abn['has_i3q'] or (is_complex and abn['abnorm_count'] == 3):
+        return 'Poor'
+    if abn['is_normal'] or (has_del5q and not has_del7 and not has_del17p) or \
+       (abn['has_del12p'] and not has_del7) or (abn['has_del20q'] and not has_del7):
+        return 'Good'
+    if has_del7 and not abn['has_minus7'] and not has_del17p:
+        return 'Intermediate'
+    if abn['has_plus8'] or abn['has_plus19'] or abn['has_i17q'] or \
+       (abn['abnorm_count'] in (1, 2) and not abn['has_minus7']):
+        return 'Intermediate'
+    return 'NA'
+
+
+# ============================================================================
+#  隊列格式轉換 (Cohort Converter)
+#  自動偵測並轉換不同醫院/研究隊列的欄位名稱與結構
+# ============================================================================
+
+def detect_cohort_type(df):
+    """
+    根據欄位名稱自動偵測隊列來源類型。
+
+    回傳 str: 'FJUH' / 'HSCT' / 'UNKNOWN'
+    """
+    columns_lower = [str(col).lower().strip() for col in df.columns]
+    fjuh_markers = ['ethnicity', 'diagnosis', 'karyotype']
+    hsct_markers = ['transplant', 'graft', 'donor', 'conditioning']
+    fjuh_count = sum(1 for m in fjuh_markers if any(m in c for c in columns_lower))
+    hsct_count = sum(1 for m in hsct_markers if any(m in c for c in columns_lower))
+    if hsct_count > fjuh_count:
+        return 'HSCT'
+    elif fjuh_count > 0:
+        return 'FJUH'
+    return 'UNKNOWN'
+
+
+def find_column_mapping(input_df):
+    """
+    根據 COLUMN_ALIASES 對照表，自動找出輸入欄位對應到哪個標準 IPSSM 欄位。
+
+    回傳 dict: {原始欄名: 標準欄名}
+    """
+    mapping = {}
+    used_cols = set()
+    for std_col, aliases in COLUMN_ALIASES.items():
+        for input_col in input_df.columns:
+            if input_col in used_cols:
+                continue
+            col_upper = str(input_col).strip().upper()
+            for alias in aliases:
+                if col_upper == alias.upper():
+                    mapping[input_col] = std_col
+                    used_cols.add(input_col)
+                    break
+            if input_col in used_cols:
+                break
+    return mapping
+
+
 # ============================================================================
 #  第一階段：資料驗證 (Screener)
 # ============================================================================
@@ -156,48 +375,41 @@ class ValidationReport:
             f"\nSummary: {len(self.errors)} ERRORS, {len(self.warnings)} WARNINGS, "
             f"{len(self.auto_fixes)} AUTO-FIXES, {len(self.skipped_patients)} SKIPPED\n"
         ]
-
         if self.format_conversions:
             lines.append("\n--- FORMAT CONVERSIONS ---")
             for conv in self.format_conversions[:10]:
                 lines.append(f"  {conv}")
             if len(self.format_conversions) > 10:
                 lines.append(f"  ... and {len(self.format_conversions) - 10} more")
-
         if self.input_rows > 0:
             lines.append("\n--- INFO ---")
             lines.append(f"  [INFO] Input: {self.input_rows} rows x {self.input_cols} columns")
-            lines.append(f"  [INFO] Output: {self.output_rows} rows x {self.output_cols} columns (after skipping incomplete records)")
+            lines.append(f"  [INFO] Output: {self.output_rows} rows x {self.output_cols} columns")
             lines.append(f"  [INFO] Skipped: {len(self.skipped_patients)} patients with missing required fields")
-
         if self.skipped_patients:
             lines.append(f"\n--- SKIPPED PATIENTS ({len(self.skipped_patients)}) ---")
             for skip in self.skipped_patients[:20]:
                 lines.append(f"  [SKIP] {skip}")
             if len(self.skipped_patients) > 20:
                 lines.append(f"  ... and {len(self.skipped_patients) - 20} more")
-
         if self.auto_fixes:
             lines.append(f"\n--- AUTO-FIXES APPLIED ({len(self.auto_fixes)}) ---")
             for fix in self.auto_fixes[:30]:
                 lines.append(f"  {fix}")
             if len(self.auto_fixes) > 30:
                 lines.append(f"  ... and {len(self.auto_fixes) - 30} more")
-
         if self.errors:
             lines.append(f"\n--- ERRORS ({len(self.errors)}) ---")
             for error in self.errors[:20]:
                 lines.append(f"  {error}")
             if len(self.errors) > 20:
                 lines.append(f"  ... and {len(self.errors) - 20} more")
-
         if self.warnings:
             lines.append(f"\n--- WARNINGS ({len(self.warnings)}) ---")
             for warning in self.warnings[:20]:
                 lines.append(f"  {warning}")
             if len(self.warnings) > 20:
                 lines.append(f"  ... and {len(self.warnings) - 20} more")
-
         if len(self.errors) == 0 and len(self.skipped_patients) == 0:
             lines.append("\n>>> PASS: Data is ready for R IPSSMwrapper execution.")
         elif len(self.errors) == 0:
@@ -205,7 +417,6 @@ class ValidationReport:
                          f"(after skipping {len(self.skipped_patients)} incomplete records).")
         else:
             lines.append(f"\n>>> FAIL: {len(self.errors)} validation errors found.")
-
         return '\n'.join(lines) + '\n'
 
 
@@ -224,59 +435,79 @@ def _read_input_file(input_path):
 
 def _try_convert_cohort(input_path, report):
     """
-    Attempt to convert input file to standard IPSSM format.
-    Returns:
-        - (rows, fieldnames, needs_conversion) if conversion applied
-        - (rows, fieldnames, False) if already in standard format
+    嘗試自動偵測並轉換輸入檔案的隊列格式。
+
+    流程:
+      1. 偵測隊列類型 (FJUH / HSCT / UNKNOWN)
+      2. 自動對應欄位名稱到 IPSSM 標準欄位
+      3. 若有 karyotype 欄位，自動解析為細胞遺傳學欄位
+      4. 補齊缺失欄位為 'NA'
+
+    回傳 (rows, fieldnames, converted: bool)
     """
     try:
-        # Read input file as dataframe
         input_path = Path(input_path)
         if input_path.suffix.lower() == '.xlsx':
             df = pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
         else:
             df = pd.read_csv(input_path, dtype=str, keep_default_na=False)
-        
-        # Detect cohort type
+
         cohort_type = detect_cohort_type(df)
-        
-        # Find column mapping
         mapping = find_column_mapping(df)
-        
-        # Check if conversion is needed (not all input columns are in standard format)
         is_standard = len(mapping) == len(df.columns) and set(mapping.values()) == set(df.columns)
-        
-        if cohort_type != "UNKNOWN" and not is_standard:
+
+        if cohort_type != 'UNKNOWN' and not is_standard:
             print(f"\n  [COHORT DETECTION] Detected format: {cohort_type}")
             print(f"  [COLUMN MAPPING] Found {len(mapping)}/{len(df.columns)} matching columns")
-            
-            # Apply column mapping
+
             df_converted = df.rename(columns=mapping)
-            
-            # Add missing columns with NA
+
+            # 自動解析核型欄位
+            karyotype_col = None
+            for col in df.columns:
+                if 'karyotype' in col.lower():
+                    karyotype_col = col
+                    break
+
+            if karyotype_col and 'del5q' not in df_converted.columns:
+                print(f"  [AUTO] Parsing karyotype from '{karyotype_col}'...")
+                parsed_count = 0
+                for idx, row in df_converted.iterrows():
+                    karyotype_val = df.loc[idx, karyotype_col]
+                    if karyotype_val:
+                        parsed = parse_karyotype(karyotype_val)
+                        df_converted.at[idx, 'del5q'] = str(parsed['del5q'])
+                        df_converted.at[idx, 'del7_7q'] = str(parsed['del7_7q'])
+                        df_converted.at[idx, 'del17_17p'] = str(parsed['del17p'])
+                        df_converted.at[idx, 'complex'] = str(parsed['complex'])
+                        df_converted.at[idx, 'CYTO_IPSSR'] = parsed['cyto_ipssr']
+                        parsed_count += 1
+                    else:
+                        df_converted.at[idx, 'del5q'] = '0'
+                        df_converted.at[idx, 'del7_7q'] = '0'
+                        df_converted.at[idx, 'del17_17p'] = '0'
+                        df_converted.at[idx, 'complex'] = '0'
+                        df_converted.at[idx, 'CYTO_IPSSR'] = 'NA'
+                print(f"  [OK] Parsed {parsed_count} karyotypes")
+
             missing_cols = set(STANDARD_IPSSM_COLUMNS) - set(df_converted.columns)
             if missing_cols:
-                print(f"  [MISSING COLUMNS] Adding {len(missing_cols)} missing columns: {', '.join(sorted(missing_cols)[:5])}{'...' if len(missing_cols) > 5 else ''}")
+                print(f"  [MISSING COLUMNS] Adding {len(missing_cols)} missing columns: "
+                      f"{', '.join(sorted(missing_cols)[:5])}{'...' if len(missing_cols) > 5 else ''}")
                 for col in missing_cols:
                     df_converted[col] = 'NA'
-            
-            # Reorder to standard format
+
             df_converted = df_converted[STANDARD_IPSSM_COLUMNS]
-            
-            # Convert back to rows/fieldnames format
             rows = df_converted.to_dict('records')
             fieldnames = list(df_converted.columns)
-            
             report.add_conversion(f"Cohort type '{cohort_type}'", "Standard IPSSM format")
             return rows, fieldnames, True
-        
-        # Already in standard format or unknown format
+
         rows, fieldnames = _read_input_file(input_path)
         return rows, fieldnames, False
-        
+
     except Exception as e:
         print(f"  [CONVERSION WARNING] Could not auto-detect cohort format: {e}")
-        # Fall back to regular input reading
         rows, fieldnames = _read_input_file(input_path)
         return rows, fieldnames, False
 
@@ -306,20 +537,33 @@ def _convert_fjuh_format(rows, fieldnames, report):
 
 
 def _validate_row(row_idx, row, report):
-    """驗證單一資料列，回傳 True=有效 / False=跳過"""
+    """
+    驗證單一資料列，回傳 True=有效 / False=跳過。
+
+    驗證步驟:
+      1. NA 標準化 (含 ND -> NA 轉換)
+      2. 必填欄位檢查 (HB, PLT, BM_BLAST)
+      3. 數值範圍檢查
+      4. 二元欄位 (0/1) 檢查
+      5. 分類欄位 (CYTO_IPSSR, TP53mut) 檢查
+    """
     patient_id = row.get('ID', f'Row{row_idx}')
+
+    # NA 標準化 (including ND -> NA for CYTO_IPSSR)
+    for col, value in row.items():
+        if isinstance(value, str):
+            if col == 'CYTO_IPSSR' and value.strip().upper() == 'ND':
+                row[col] = 'NA'
+                report.add_fix(row_idx, col, value, 'NA', 'Converted ND (not detected) to NA')
+            elif value in NA_STRINGS:
+                row[col] = 'NA'
+                report.add_fix(row_idx, col, value, 'NA', 'Converted NA-like value to standard NA')
 
     # 必填欄位檢查
     missing = [f for f in REQUIRED_FIELDS if row.get(f, '').strip() in NA_STRINGS or row.get(f, '').strip() == '']
     if missing:
         report.skip_patient(patient_id, f"Missing required field(s): {', '.join(missing)}")
         return False
-
-    # NA 標準化
-    for col, value in row.items():
-        if isinstance(value, str) and value in NA_STRINGS:
-            row[col] = 'NA'
-            report.add_fix(row_idx, col, value, 'NA', 'Converted NA-like value to standard NA')
 
     # 數值範圍檢查
     for col in ['HB', 'PLT', 'BM_BLAST', 'TP53maxvaf']:
@@ -341,27 +585,35 @@ def _validate_row(row_idx, row, report):
         value = row.get(col, 'NA')
         if isinstance(value, str):
             value = value.strip()
-        if value != 'NA' and value not in ['0', '1']:
+        if value != 'NA' and value not in ('0', '1'):
             report.add_error(row_idx, col, f"Binary field must be 0 or 1, got: {value}")
 
     # 分類欄位檢查
     cyto = row.get('CYTO_IPSSR', 'NA')
     if isinstance(cyto, str):
         cyto = cyto.strip()
-    if cyto not in ['NA', 'Very Good', 'Good', 'Intermediate', 'Poor', 'Very Poor']:
+    if cyto not in ('NA', 'Very Good', 'Good', 'Intermediate', 'Poor', 'Very Poor'):
         report.add_error(row_idx, 'CYTO_IPSSR', f"Invalid category: {cyto}")
 
     tp53 = row.get('TP53mut', 'NA')
     if isinstance(tp53, str):
         tp53 = tp53.strip()
-    if tp53 not in ['NA', '0', '1', '2', '2 or more']:
+    if tp53 not in ('NA', '0', '1', '2', '2 or more'):
         report.add_error(row_idx, 'TP53mut', f"Invalid value: {tp53}")
 
     return len(report.errors) == 0
 
 
 def run_screening(input_path, output_path, log_path):
-    """執行資料驗證（第一階段），回傳是否成功"""
+    """
+    執行資料驗證（第一階段），回傳是否成功。
+
+    流程:
+      1. 嘗試隊列格式轉換 (_try_convert_cohort)
+      2. 修復欄名空格 (_convert_fjuh_format)
+      3. 逐列驗證 (_validate_row)
+      4. 輸出清理後 CSV 與驗證日誌
+    """
     print(f"\n{'='*60}")
     print(f"  [階段 1] 資料驗證 & 格式轉換")
     print(f"{'='*60}")
@@ -373,14 +625,12 @@ def run_screening(input_path, output_path, log_path):
     valid_rows = []
 
     try:
-        # Try to convert cohort format first
         rows, fieldnames, converted = _try_convert_cohort(input_path, report)
         if converted:
             print(f"  [OK] Successfully converted to standard IPSSM format\n")
-        
+
         report.input_cols = len(fieldnames)
         report.input_rows = len(rows)
-
         rows = _convert_fjuh_format(rows, fieldnames, report)
 
         for row_idx, row in enumerate(rows, start=2):
@@ -391,7 +641,10 @@ def run_screening(input_path, output_path, log_path):
             if _validate_row(row_idx, cleaned, report):
                 valid_rows.append(cleaned)
 
-        final_rows = [{col: row.get(col, 'NA') for col in STANDARD_COLUMNS} for row in valid_rows]
+        final_rows = []
+        for row in valid_rows:
+            final_row = {col: row.get(col, 'NA') for col in STANDARD_COLUMNS}
+            final_rows.append(final_row)
         report.output_rows = len(final_rows)
         report.output_cols = len(STANDARD_COLUMNS)
 
@@ -426,7 +679,7 @@ def run_screening(input_path, output_path, log_path):
 # ============================================================================
 
 def _find_rscript():
-    """自動尋找 Rscript 路徑"""
+    """自動尋找 Rscript 路徑 (Windows 搜尋常見安裝路徑)"""
     candidates = [
         r"C:\Program Files\R\R-4.5.2\bin\Rscript.exe",
         r"C:\Program Files\R\R-4.4.2\bin\Rscript.exe",
@@ -479,14 +732,12 @@ def _save_excel(r_results, output_path, validation_data=None):
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-
     for row in r_results:
         ws.append([row.get('ID', ''), row.get('Confidence_Level', 'NA')])
         if row.get('Confidence_Level') == 'UNCERTAIN':
             for cell in ws[ws.max_row]:
                 cell.fill = uncertain_fill
                 cell.font = uncertain_font
-
     ws.column_dimensions['A'].width = 12
     ws.column_dimensions['B'].width = 16
 
@@ -560,7 +811,6 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
     r_output_csv = output_dir / f"{input_path.stem}_r_output.csv"
     excel_output = output_dir / f"{input_path.stem}_results.xlsx"
 
-    # 尋找驗證檔案
     if not validation_path:
         potential = output_dir / "IPSSM_validation_result.xlsx"
         if potential.exists():
@@ -572,7 +822,6 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
     if validation_path:
         print(f"  驗證檔:  {validation_path}")
 
-    # 建立並執行 R 腳本
     with tempfile.NamedTemporaryFile(mode='w', suffix='.R', delete=False) as f:
         f.write(R_SCRIPT_TEMPLATE)
         r_script_file = f.name
@@ -580,7 +829,10 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
     try:
         print("\n  執行 R IPSSMwrapper...")
         cmd = [rscript, r_script_file, str(input_path), str(r_output_csv)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        r_env = os.environ.copy()
+        r_env["R_LIBS_USER"] = os.path.expanduser("~/R/library")
+        result = subprocess.run(cmd, capture_output=True, text=True, env=r_env)
 
         if result.stdout:
             print(result.stdout)
@@ -595,9 +847,11 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 
         if not r_output_csv.exists():
             print("  [ERROR] ERROR: R 輸出檔案未產生")
+            with open(output_dir / "r_error.log", "w", encoding="utf-8") as f:
+                f.write("R completed but output file was not generated.\n\n[STDOUT]\n"
+                        + (result.stdout or "") + "\n\n[STDERR]\n" + (result.stderr or ""))
             return False
 
-        # 處理結果
         print("  處理結果中...")
         r_results = _read_r_output(r_output_csv)
 
@@ -655,7 +909,6 @@ def main():
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*60}")
 
-    # === 僅翻譯模式 ===
     if args.translate_only:
         success = run_translation(str(input_path), args.rscript, validation_path)
         print(f"\n{'='*60}")
@@ -663,24 +916,20 @@ def main():
         print(f"{'='*60}")
         sys.exit(0 if success else 1)
 
-    # === 執行驗證 ===
     cleaned_csv = input_path.parent / f"{input_path.stem}_cleaned.csv"
     log_path = input_path.parent / f"{input_path.stem}_screening_log.txt"
-
     screen_ok = run_screening(input_path, cleaned_csv, log_path)
 
     if not screen_ok:
         print("\n  [ERROR] 驗證階段有錯誤，請檢查日誌。")
         sys.exit(1)
 
-    # === 僅驗證模式 ===
     if args.screen_only:
         print(f"\n{'='*60}")
         print(f"  完成！（僅驗證模式）")
         print(f"{'='*60}")
         sys.exit(0)
 
-    # === 執行 R 計算 ===
     translate_ok = run_translation(str(cleaned_csv), args.rscript, validation_path)
 
     print(f"\n{'='*60}")
