@@ -1,5 +1,6 @@
 r-base
 r-base-dev
+r-cran-remotes
 libcurl4-openssl-dev
 libssl-dev
 libxml2-dev
@@ -8,5 +9,5 @@ libharfbuzz-dev
 libfribidi-dev
 libfreetype-dev
 libpng-dev
-libtiff5-dev
+libtiff-dev
 libjpeg-dev

@@ -63,8 +63,9 @@ args <- commandArgs(trailingOnly=TRUE)
 input_csv    <- args[1]
 output_csv   <- args[2]
 
-# Setup library paths
+# Setup library paths (雲端 + 本地 Windows)
 lib_candidates <- c(
+  path.expand("~/R/library"),
   path.expand("~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5"),
   path.expand("~/AppData/Local/R/win-library/4.5"),
   "C:/Users/user/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5",
@@ -72,7 +73,7 @@ lib_candidates <- c(
 )
 
 for (lib_path in lib_candidates) {{
-  .libPaths(c(lib_path, .libPaths()))
+  if (dir.exists(lib_path)) .libPaths(c(lib_path, .libPaths()))
 }}
 
 suppressPackageStartupMessages({{

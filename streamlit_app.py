@@ -145,21 +145,30 @@ def main():
     @st.cache_resource(show_spinner="⏳ 正在初始化雲端 R 執行環境與 IPSSM 核心套件 (⚠️ 伺服器初次部署時約需花費 3~5 分鐘安裝，請耐心等待...)")
     def setup_r_environment():
         rscript = "Rscript" if os.name == "posix" else _find_rscript()
-        if rscript:
-            try:
-                # 檢查是否已安裝 ipssm
-                check_cmd = [rscript, "-e", "if(!require('ipssm')) quit(status=1)"]
-                if subprocess.run(check_cmd).returncode == 0:
-                    return True
-                # 若未安裝，呼叫安裝腳本
-                result = subprocess.run([rscript, "install.R"], capture_output=True, text=True)
-                if result.returncode != 0:
-                    st.toast(f"R 套件安裝失敗：\n{result.stderr}", icon="❌")
-                    return False
+        if not rscript:
+            return False
+        try:
+            # 設定使用者可寫的 R 函式庫路徑
+            user_r_lib = os.path.expanduser("~/R/library")
+            os.makedirs(user_r_lib, exist_ok=True)
+            env = os.environ.copy()
+            env["R_LIBS_USER"] = user_r_lib
+
+            # 檢查 ipssm 是否已安裝
+            check_cmd = [rscript, "-e", "library(ipssm)"]
+            if subprocess.run(check_cmd, env=env, capture_output=True).returncode == 0:
                 return True
-            except Exception as e:
+
+            # 若未安裝，呼叫 install.R 安裝腳本
+            install_r_path = os.path.join(os.path.dirname(__file__), "install.R")
+            result = subprocess.run([rscript, install_r_path], capture_output=True, text=True, env=env, timeout=600)
+            if result.returncode != 0:
+                st.toast(f"R 套件安裝失敗：\n{result.stderr}", icon="❌")
                 return False
-        return False
+            return True
+        except Exception as e:
+            st.toast(f"R 環境初始化異常：{e}", icon="❌")
+            return False
 
     st.markdown("---")
     st.subheader("⚠️ 法律與合規確認")
