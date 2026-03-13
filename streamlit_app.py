@@ -14,6 +14,48 @@ try:
 except ImportError:
     HAS_PIPELINE = False
 
+
+@st.cache_resource(show_spinner="⏳ 正在初始化雲端 R 執行環境與 IPSSM 核心套件 (⚠️ 伺服器初次部署時約需花費 3~5 分鐘安裝，請耐心等待...)")
+def setup_r_environment():
+    rscript = "Rscript" if os.name == "posix" else (_find_rscript() if HAS_PIPELINE else None)
+    if not rscript:
+        return False
+    try:
+        # 設定使用者可寫的 R 函式庫路徑
+        user_r_lib = os.path.expanduser("~/R/library")
+        os.makedirs(user_r_lib, exist_ok=True)
+        env = os.environ.copy()
+        env["R_LIBS_USER"] = user_r_lib
+
+        # 檢查 ipssm 是否已安裝 (包含雲端與本地路徑)
+        check_script = """
+        lib_candidates <- c(
+          path.expand("~/R/library"),
+          path.expand("~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5"),
+          path.expand("~/AppData/Local/R/win-library/4.5"),
+          "C:/Users/user/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5",
+          "C:/Users/user/AppData/Local/R/win-library/4.5"
+        )
+        for (lib_path in lib_candidates) {
+          if (dir.exists(lib_path)) .libPaths(c(lib_path, .libPaths()))
+        }
+        if (!require('ipssm', quietly=TRUE)) quit(status=1)
+        """
+        check_cmd = [rscript, "-e", check_script]
+        if subprocess.run(check_cmd, env=env, capture_output=True).returncode == 0:
+            return True
+
+        # 若未安裝，呼叫 install.R 安裝腳本
+        install_r_path = os.path.join(os.path.dirname(__file__), "install.R")
+        result = subprocess.run([rscript, install_r_path], capture_output=True, text=True, env=env, timeout=600)
+        if result.returncode != 0:
+            st.toast(f"R 套件安裝失敗：\n{result.stderr}", icon="❌")
+            return False
+        return True
+    except Exception as e:
+        st.toast(f"R 環境初始化異常：{e}", icon="❌")
+        return False
+
 # ==========================================
 # 參數與常數定義 (用於 API 模式)
 # ==========================================
@@ -141,47 +183,6 @@ def main():
     """)
 
     engine = st.radio("⚙️ 選擇計算引擎", ["1️⃣ R 模型引擎 (推薦，支援所有的資料缺失處理)", "2️⃣ 官方 Web API (速度快，但 CYTO_IPSSR 不可空白)"])
-
-    @st.cache_resource(show_spinner="⏳ 正在初始化雲端 R 執行環境與 IPSSM 核心套件 (⚠️ 伺服器初次部署時約需花費 3~5 分鐘安裝，請耐心等待...)")
-    def setup_r_environment():
-        rscript = "Rscript" if os.name == "posix" else _find_rscript()
-        if not rscript:
-            return False
-        try:
-            # 設定使用者可寫的 R 函式庫路徑
-            user_r_lib = os.path.expanduser("~/R/library")
-            os.makedirs(user_r_lib, exist_ok=True)
-            env = os.environ.copy()
-            env["R_LIBS_USER"] = user_r_lib
-
-            # 檢查 ipssm 是否已安裝 (包含雲端與本地路徑)
-            check_script = """
-            lib_candidates <- c(
-              path.expand("~/R/library"),
-              path.expand("~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5"),
-              path.expand("~/AppData/Local/R/win-library/4.5"),
-              "C:/Users/user/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5",
-              "C:/Users/user/AppData/Local/R/win-library/4.5"
-            )
-            for (lib_path in lib_candidates) {
-              if (dir.exists(lib_path)) .libPaths(c(lib_path, .libPaths()))
-            }
-            if (!require('ipssm', quietly=TRUE)) quit(status=1)
-            """
-            check_cmd = [rscript, "-e", check_script]
-            if subprocess.run(check_cmd, env=env, capture_output=True).returncode == 0:
-                return True
-
-            # 若未安裝，呼叫 install.R 安裝腳本
-            install_r_path = os.path.join(os.path.dirname(__file__), "install.R")
-            result = subprocess.run([rscript, install_r_path], capture_output=True, text=True, env=env, timeout=600)
-            if result.returncode != 0:
-                st.toast(f"R 套件安裝失敗：\n{result.stderr}", icon="❌")
-                return False
-            return True
-        except Exception as e:
-            st.toast(f"R 環境初始化異常：{e}", icon="❌")
-            return False
 
     st.markdown("---")
     st.subheader("⚠️ 法律與合規確認")
