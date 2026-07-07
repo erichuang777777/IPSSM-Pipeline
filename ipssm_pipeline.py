@@ -318,27 +318,151 @@ def detect_cohort_type(df):
     return 'UNKNOWN'
 
 
+# 括號內容若「整段」符合常見檢驗單位樣式才會被移除 (例如 "(g/dL)", "(%)",
+# "(x10^9/L)")；否則保留括號內容，避免破壞像 del(5q)/del(17p) 這種括號本身就是
+# 欄位語意一部分的別名 (5q/17p 不是單位，不該被當成單位噪音濾掉)。
+_UNIT_PAREN_RE = re.compile(
+    r'^[\d.]*(G/DL|MG/DL|G/L|MMOL/L|UMOL/L|X?10\^?9/?L|%|/UL|/ML|K/UL)$'
+)
+
+
+def _normalize_header(name):
+    """
+    將欄名正規化以供比對: 轉大寫、視情況移除括號內的單位標註、
+    把底線/連字號/空白/句點/斜線視為分隔符移除。
+
+    僅做正規化比對，不做模糊/相似度比對，避免誤判。
+    """
+    if name is None:
+        return ''
+    s = str(name).strip().upper()
+
+    def _paren_repl(m):
+        inner = re.sub(r'\s+', '', m.group(1))
+        return '' if _UNIT_PAREN_RE.match(inner) else inner
+
+    s = re.sub(r'\(([^)]*)\)', _paren_repl, s)  # 括號: 單位則移除, 否則保留內容
+    s = re.sub(r'[\s_\-./^]+', '', s)           # 移除空白/底線/連字號/句點/斜線/^
+    return s
+
+
 def find_column_mapping(input_df):
     """
     根據 COLUMN_ALIASES 對照表，自動找出輸入欄位對應到哪個標準 IPSSM 欄位。
+
+    比對時會先正規化欄名(去除單位括號、底線、空白、大小寫差異)，
+    例如 "Hemoglobin (g/dL)" 或 "PLT_count" 仍能對應到標準欄位。
 
     回傳 dict: {原始欄名: 標準欄名}
     """
     mapping = {}
     used_cols = set()
     for std_col, aliases in COLUMN_ALIASES.items():
+        normalized_aliases = {_normalize_header(a) for a in aliases}
         for input_col in input_df.columns:
             if input_col in used_cols:
                 continue
-            col_upper = str(input_col).strip().upper()
-            for alias in aliases:
-                if col_upper == alias.upper():
-                    mapping[input_col] = std_col
-                    used_cols.add(input_col)
-                    break
-            if input_col in used_cols:
-                break
+            if _normalize_header(input_col) in normalized_aliases:
+                mapping[input_col] = std_col
+                used_cols.add(input_col)
+                break  # 每個標準欄位只對應第一個匹配到的來源欄，維持一對一
     return mapping
+
+
+def _read_any_table(input_path):
+    """讀取 CSV 或 Excel 為 DataFrame(皆為字串型別)，供 inspect/cohort 轉換共用。"""
+    input_path = Path(input_path)
+    if input_path.suffix.lower() == '.xlsx':
+        return pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
+    return pd.read_csv(input_path, dtype=str, keep_default_na=False)
+
+
+def inspect_columns(input_path):
+    """
+    唯讀掃描來源檔案標題並回報欄位對應狀況，不寫任何輸出檔、不執行驗證或計算。
+
+    用於「來源檔案不是乾淨標準表格」時，先讓使用者(或呼叫此函式的 agent skill)
+    確認自動對應是否正確，再決定是否繼續執行完整流程。
+
+    回傳 dict:
+      cohort_type:            偵測到的隊列類型 (FJUH/HSCT/UNKNOWN，僅供參考)
+      input_columns:          來源檔案的原始欄名列表
+      matched:                {來源欄名: 標準欄名} 確定匹配的對應
+      missing_required:       必填但未匹配到的標準欄位 (HB/PLT/BM_BLAST) — 會導致該病患被跳過
+      missing_optional:       選填但未匹配到的標準欄位 — 安全填為 NA
+      unmapped_input_columns: 來源欄位中未對應到任何標準欄位的欄名
+      warnings:               健檢提示 (例如 HB 數值量級疑似單位錯誤)
+    """
+    df = _read_any_table(input_path)
+
+    cohort_type = detect_cohort_type(df)
+    mapping = find_column_mapping(df)
+    matched_std_cols = set(mapping.values())
+
+    missing_std_cols = [c for c in STANDARD_COLUMNS if c not in matched_std_cols]
+    missing_required = [c for c in missing_std_cols if c in REQUIRED_FIELDS]
+    missing_optional = [c for c in missing_std_cols if c not in REQUIRED_FIELDS]
+    unmapped_input_columns = [c for c in df.columns if c not in mapping]
+
+    warnings = []
+    hb_input_col = next((src for src, std in mapping.items() if std == 'HB'), None)
+    if hb_input_col is not None:
+        numeric = pd.to_numeric(df[hb_input_col], errors='coerce').dropna()
+        if len(numeric) > 0 and numeric.median() > 25:
+            warnings.append(
+                f"[UNIT CHECK] 欄位 '{hb_input_col}' (對應 HB) 數值中位數為 {numeric.median():.1f}，"
+                f"明顯高於 IPSS-M 所需的 g/dL 範圍 (4-20)。若您的資料是 g/L 單位，"
+                f"請先將該欄除以 10 再輸入 (只提示不自動轉換，避免靜默改資料)。"
+            )
+
+    return {
+        'cohort_type': cohort_type,
+        'input_columns': list(df.columns),
+        'matched': mapping,
+        'missing_required': missing_required,
+        'missing_optional': missing_optional,
+        'unmapped_input_columns': unmapped_input_columns,
+        'warnings': warnings,
+    }
+
+
+def print_inspect_report(result):
+    """將 inspect_columns() 的結果印成人類可讀的預覽報告。"""
+    print(f"\n{'='*60}")
+    print(f"  欄位掃描預覽 (--inspect，唯讀，不寫入任何輸出檔)")
+    print(f"{'='*60}")
+    print(f"  偵測隊列類型: {result['cohort_type']} (僅供參考)")
+    print(f"  來源欄位數:   {len(result['input_columns'])}")
+
+    print(f"\n--- 確定匹配 ({len(result['matched'])}) ---")
+    for src, std in sorted(result['matched'].items(), key=lambda kv: kv[1]):
+        print(f"  [OK] '{src}' -> {std}")
+
+    if result['missing_required']:
+        print(f"\n--- !! 必填欄位缺失 ({len(result['missing_required'])}) — 會導致病患被跳過 ---")
+        for col in result['missing_required']:
+            print(f"  [MISSING-REQUIRED] {col}")
+
+    if result['missing_optional']:
+        print(f"\n--- 選填欄位缺失 ({len(result['missing_optional'])}) — 將安全填為 NA ---")
+        shown = result['missing_optional'][:10]
+        print(f"  {', '.join(shown)}" + (f" ... 及其他 {len(result['missing_optional']) - 10} 個" if len(result['missing_optional']) > 10 else ""))
+
+    if result['unmapped_input_columns']:
+        print(f"\n--- 來源欄位中未對應到任何標準欄位 ({len(result['unmapped_input_columns'])}) ---")
+        for col in result['unmapped_input_columns']:
+            print(f"  [unmapped] '{col}'")
+
+    for w in result['warnings']:
+        print(f"\n  {w}")
+
+    print()
+    if result['missing_required']:
+        print("  >>> 建議: 請確認上述必填欄位在來源檔案中的實際欄名，")
+        print("            必要時手動重新命名欄位，或告知對應的欄名後再重新執行。")
+    else:
+        print("  >>> 必填欄位皆已確定匹配，可以繼續執行完整計算。")
+    print()
 
 
 # ============================================================================
@@ -451,16 +575,17 @@ def _try_convert_cohort(input_path, report):
     """
     try:
         input_path = Path(input_path)
-        if input_path.suffix.lower() == '.xlsx':
-            df = pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
-        else:
-            df = pd.read_csv(input_path, dtype=str, keep_default_na=False)
+        df = _read_any_table(input_path)
 
         cohort_type = detect_cohort_type(df)
         mapping = find_column_mapping(df)
         is_standard = len(mapping) == len(df.columns) and set(mapping.values()) == set(df.columns)
 
-        if cohort_type != 'UNKNOWN' and not is_standard:
+        # 欄位對應不再只在偵測到已知隊列類型(FJUH/HSCT)時才嘗試 — 完全自訂的醫院
+        # 格式(無 ethnicity/diagnosis/karyotype/transplant 等特徵欄)先前會讓 cohort_type
+        # 停在 UNKNOWN、整段轉換邏輯被跳過，導致欄位對應完全不執行。只要找到任何
+        # 可用的別名對應就進行轉換；cohort_type 僅作為報告用的描述性標籤。
+        if mapping and not is_standard:
             print(f"\n  [COHORT DETECTION] Detected format: {cohort_type}")
             print(f"  [COLUMN MAPPING] Found {len(mapping)}/{len(df.columns)} matching columns")
 
@@ -984,6 +1109,9 @@ def main():
     parser.add_argument('--rscript', help='Rscript 執行路徑')
     parser.add_argument('--screen-only', action='store_true', help='僅執行資料驗證，不執行 R 計算')
     parser.add_argument('--translate-only', action='store_true', help='僅執行 R 計算（輸入須為已清理的 CSV）')
+    parser.add_argument('--inspect', action='store_true',
+                         help='唯讀掃描來源檔案標題並顯示欄位對應預覽，不執行驗證/計算、不寫任何檔案。'
+                              '適合用於不確定欄名是否能自動對應的「不乾淨」來源檔案。')
 
     args = parser.parse_args()
     input_path = Path(args.input_file)
@@ -991,6 +1119,10 @@ def main():
     if not input_path.exists():
         print(f"ERROR: 輸入檔案不存在: {input_path}")
         sys.exit(1)
+
+    if args.inspect:
+        print_inspect_report(inspect_columns(str(input_path)))
+        sys.exit(0)
 
     validation_path = Path(args.validation) if args.validation else None
 

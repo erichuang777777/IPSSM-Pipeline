@@ -14,7 +14,28 @@ python ipssm_pipeline.py cleaned.csv --translate-only  # 僅 R 計算
 
 # 帶驗證比對
 python ipssm_pipeline.py data.xlsx -v validation.xlsx
+
+# 來源檔案欄名不確定能否自動對應時，先唯讀掃描預覽(不寫檔、不計算)
+python ipssm_pipeline.py data.xlsx --inspect
 ```
+
+## 作為本地 Agent Skill 使用（Claude Code）
+
+本專案內附一個 Claude Code agent skill（`.claude/skills/ipssm/`），讓你不必開網頁、
+直接在本機用自然語言請 Claude 對一份病患 CSV/Excel 批次計算 IPSS-M。
+
+**用法**：在本專案目錄開 Claude Code，然後說例如「幫我算這個 `cohort.xlsx` 的 IPSS-M」。
+Claude 會自動載入 skill，先檢查依賴（Python 套件 / R / `ipssm` 套件，缺的話引導安裝），
+再執行 pipeline，最後把結果 Excel 交給你並摘要 CONFIDENT / UNCERTAIN 筆數。
+
+skill 也附了一個從任意目錄都能執行的包裝腳本：
+
+```bash
+bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only ...]
+```
+
+> 引擎：skill 預設走**本地 R 引擎**（離線、支援缺細胞遺傳學的情境分析）。
+> 需連網的官方 REST API 引擎仍保留在 `streamlit_app.py` 的網頁版中。
 
 ## 流程說明
 
@@ -57,6 +78,26 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
   **不會**影響其他正常病患，也不會讓整批作廢。只有在 0 筆有效資料時才回報失敗。
 - **核型欄位保留**：cohort 自動轉換時，由核型解析出的 `complex` / `del17_17p`
   等欄位會完整帶入輸出，不再被丟棄。
+- **欄位自動對應不再限定隊列類型**：只要欄名(或其正規化後的形式，例如去除單位括號、
+  底線)能對到 `COLUMN_ALIASES`，無論是否偵測到已知的 FJUH/HSCT 特徵欄都會嘗試轉換。
+  來源檔案欄名不確定時，建議先跑 `--inspect` 預覽對應結果，見上方「快速開始」。
+
+## ⚠️ 計算引擎差異聲明
+
+本專案提供兩套**分別維護**的 IPSS-M 計算實作，兩者的計算規則、缺失資料處理方式不完全相同：
+
+| | R 引擎 (本地 `ipssm` 套件，CLI/skill 預設) | 官方 Web API (`api.mds-risk-model.com`，Streamlit 網頁版選項) |
+|---|---|---|
+| 執行方式 | 完全離線 | 需連網 |
+| 缺 `CYTO_IPSSR` | 支援情境分析 (Best/Mean/Worst + 信心等級) | **嚴格要求**，缺少會回傳 `Error 400` |
+| 版本同步 | 隨本專案/`ipssm` 套件版本 | 隨官方伺服器版本，可能不同步 |
+
+**即使兩邊輸入資料都完整，也不保證計算出的數值完全一致**（畢竟是兩套獨立維護的實作）。
+因此：
+- **請勿在同一份報告或同一批次分析中混用兩引擎的結果。**
+- 交付結果時，務必標明該筆分數是由哪個引擎產生（本地 R 引擎 或 官方 REST API）。
+- 若發現本機 CLI/skill 算出的分數與網頁 API 版本不同，這是**預期的引擎差異**，
+  不代表任一邊有 bug。
 
 ## 測試
 
@@ -76,6 +117,8 @@ pytest -q          # 純 Python 測試，不需 R 或網路
 ```
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
 ├── streamlit_app.py           # Streamlit 網頁介面
+├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
+├── tests/                     # pytest 測試 (karyotype / validation / cohort / api)
 ├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
 ├── README.md                  # 本文件
 │
