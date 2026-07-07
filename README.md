@@ -16,6 +16,24 @@ python ipssm_pipeline.py cleaned.csv --translate-only  # 僅 R 計算
 python ipssm_pipeline.py data.xlsx -v validation.xlsx
 ```
 
+## 作為本地 Agent Skill 使用（Claude Code）
+
+本專案內附一個 Claude Code agent skill（`.claude/skills/ipssm/`），讓你不必開網頁、
+直接在本機用自然語言請 Claude 對一份病患 CSV/Excel 批次計算 IPSS-M。
+
+**用法**：在本專案目錄開 Claude Code，然後說例如「幫我算這個 `cohort.xlsx` 的 IPSS-M」。
+Claude 會自動載入 skill，先檢查依賴（Python 套件 / R / `ipssm` 套件，缺的話引導安裝），
+再執行 pipeline，最後把結果 Excel 交給你並摘要 CONFIDENT / UNCERTAIN 筆數。
+
+skill 也附了一個從任意目錄都能執行的包裝腳本：
+
+```bash
+bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only ...]
+```
+
+> 引擎：skill 預設走**本地 R 引擎**（離線、支援缺細胞遺傳學的情境分析）。
+> 需連網的官方 REST API 引擎仍保留在 `streamlit_app.py` 的網頁版中。
+
 ## 流程說明
 
 ```
@@ -76,6 +94,8 @@ pytest -q          # 純 Python 測試，不需 R 或網路
 ```
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
 ├── streamlit_app.py           # Streamlit 網頁介面
+├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
+├── tests/                     # pytest 測試 (karyotype / validation / cohort / api)
 ├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
 ├── README.md                  # 本文件
 │
