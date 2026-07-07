@@ -6,123 +6,164 @@ import os
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
 
-# 載入現有的 pipeline 函數
 try:
-    from ipssm_pipeline import run_screening, run_translation, _find_rscript
+    from urllib3.util.retry import Retry
+except ImportError:  # pragma: no cover
+    Retry = None
+
+# 載入現有的 pipeline 函數與共用常數 (單一資料來源，避免重複定義失同步)
+try:
+    from ipssm_pipeline import (
+        run_screening, run_translation, _find_rscript,
+        clean_dataframe, STANDARD_COLUMNS, REQUIRED_FIELDS, NA_STRINGS,
+    )
     HAS_PIPELINE = True
 except ImportError:
     HAS_PIPELINE = False
+    # 後備定義 (僅在找不到 ipssm_pipeline.py 時使用)
+    STANDARD_COLUMNS = [
+        'ID', 'HB', 'PLT', 'BM_BLAST', 'del5q', 'del7_7q', 'complex', 'CYTO_IPSSR',
+        'del17_17p', 'TP53mut', 'TP53maxvaf', 'TP53loh', 'MLL_PTD', 'FLT3', 'ASXL1',
+        'BCOR', 'BCORL1', 'CBL', 'CEBPA', 'DNMT3A', 'ETV6', 'EZH2', 'IDH1', 'IDH2',
+        'KRAS', 'NF1', 'NPM1', 'NRAS', 'RUNX1', 'SETBP1', 'SF3B1', 'SRSF2', 'STAG2',
+        'U2AF1', 'ETNK1', 'GATA2', 'GNB1', 'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'WT1'
+    ]
+    REQUIRED_FIELDS = {'HB', 'PLT', 'BM_BLAST'}
+    NA_STRINGS = {'', ' ', 'NA', 'N/A', 'n/a', 'na', 'NaN', 'nan', 'None', 'none', '.', 'ND', 'nd'}
+    clean_dataframe = None
 
 # ==========================================
-# 參數與常數定義 (用於 API 模式)
+# API 引擎設定
 # ==========================================
-STANDARD_COLUMNS = [
-    'ID', 'HB', 'PLT', 'BM_BLAST', 'del5q', 'del7_7q', 'complex', 'CYTO_IPSSR',
-    'del17_17p', 'TP53mut', 'TP53maxvaf', 'TP53loh', 'MLL_PTD', 'FLT3', 'ASXL1',
-    'BCOR', 'BCORL1', 'CBL', 'CEBPA', 'DNMT3A', 'ETV6', 'EZH2', 'IDH1', 'IDH2',
-    'KRAS', 'NF1', 'NPM1', 'NRAS', 'RUNX1', 'SETBP1', 'SF3B1', 'SRSF2', 'STAG2',
-    'U2AF1', 'ETNK1', 'GATA2', 'GNB1', 'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'WT1'
-]
+API_URL = "https://api.mds-risk-model.com/ipssm"
+API_TIMEOUT = 15
+API_MAX_RETRIES = 3
+API_MAX_WORKERS = 8
 
-REQUIRED_FIELDS = {'HB', 'PLT', 'BM_BLAST'}
-NA_STRINGS = {'', ' ', 'NA', 'N/A', 'n/a', 'na', 'NaN', 'nan', 'None', 'none', '.', 'ND', 'nd'}
-
-class ValidationReport:
-    def __init__(self):
-        self.errors = []
-        self.skipped_patients = []
-        self.output_rows = 0
 
 def clean_data_for_api(raw_df):
-    report = ValidationReport()
-    raw_df = raw_df.astype(str)
-    
-    # 偵測並修復欄名尾部空格
-    mapping = {col: col.strip() for col in raw_df.columns if col != col.strip()}
-    if mapping:
-        raw_df = raw_df.rename(columns=mapping)
-    
+    """清理上傳資料供 API 引擎使用 (重用 pipeline 的 clean_dataframe)。"""
+    if clean_dataframe is not None:
+        return clean_dataframe(raw_df, collapse_tp53=True)
+
+    # 後備: ipssm_pipeline 不可用時的最小清理
+    class _Report:
+        def __init__(self):
+            self.skipped_patients = []
+            self.output_rows = 0
+
+    report = _Report()
+    df = raw_df.astype(str).rename(columns=lambda c: c.strip())
     valid_rows = []
-    for idx, row in raw_df.iterrows():
+    for idx, row in df.iterrows():
         row_dict = row.to_dict()
-        patient_id = row_dict.get('ID', f'Row{idx+2}')
-        
-        missing = [f for f in REQUIRED_FIELDS if row_dict.get(f, '').strip() in NA_STRINGS or row_dict.get(f, '').strip() == '']
-        if missing:
-            report.skipped_patients.append(patient_id)
+        if any(str(row_dict.get(f, '')).strip() in NA_STRINGS for f in REQUIRED_FIELDS):
+            report.skipped_patients.append(str(row_dict.get('ID', f'Row{idx + 2}')))
             continue
-            
-        cleaned_row = {}
-        for col_name, value in row_dict.items():
-            clean_col = col_name.strip()
-            clean_val = str(value).strip()
-            cleaned_row[clean_col] = 'NA' if clean_val in NA_STRINGS or pd.isna(value) else clean_val
-                
-        if cleaned_row.get('TP53mut') in ['2', '>1', '2 or more']:
-            cleaned_row['TP53mut'] = '2 or more'
-            
-        final_row = {col: cleaned_row.get(col, 'NA') for col in STANDARD_COLUMNS}
-        valid_rows.append(final_row)
-        
+        cleaned = {k: ('NA' if str(v).strip() in NA_STRINGS else str(v).strip())
+                   for k, v in row_dict.items()}
+        if cleaned.get('TP53mut') in ('2', '>1', '2 or more'):
+            cleaned['TP53mut'] = '2 or more'
+        valid_rows.append({c: cleaned.get(c, 'NA') for c in STANDARD_COLUMNS})
     report.output_rows = len(valid_rows)
-    return pd.DataFrame(valid_rows), report
+    return pd.DataFrame(valid_rows, columns=STANDARD_COLUMNS), report
+
+
+def _build_api_session():
+    """建立具連線重用與指數退避重試的 requests.Session。"""
+    session = requests.Session()
+    if Retry is not None:
+        retry = Retry(
+            total=API_MAX_RETRIES,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['POST']),
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=API_MAX_WORKERS)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    return session
+
+
+def _row_to_payload(row_dict):
+    """將一列清理後資料轉為 API payload (略過 ID 與 NA 欄位)。"""
+    payload = {}
+    for k, v in row_dict.items():
+        if k == 'ID' or v == 'NA':
+            continue
+        if k in ('CYTO_IPSSR', 'TP53mut'):
+            payload[k] = str(v)
+        else:
+            try:
+                payload[k] = float(v) if '.' in str(v) else int(float(v))
+            except (ValueError, TypeError):
+                payload[k] = str(v)
+    return payload
+
+
+def _call_api_for_row(session, row_dict):
+    """對單列呼叫 API，回傳結果 dict。網路/逾時錯誤回傳可讀訊息。"""
+    empty = {
+        "IPSSMscore": None, "IPSSMcat": None, "IPSSMscore_best": None,
+        "IPSSMscore_worst": None, "Range_Score": None, "Confidence_Level": None,
+    }
+    try:
+        response = session.post(API_URL, json=_row_to_payload(row_dict), timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            data = response.json()
+            score_best = data['ipssm']['best']['riskScore']
+            score_worst = data['ipssm']['worst']['riskScore']
+            range_score = score_worst - score_best
+            return {
+                "IPSSMscore": data['ipssm']['means']['riskScore'],
+                "IPSSMcat": data['ipssm']['means']['riskCat'],
+                "IPSSMscore_best": score_best, "IPSSMscore_worst": score_worst,
+                "Range_Score": round(range_score, 4),
+                "Confidence_Level": "CONFIDENT" if range_score < 1.0 else "UNCERTAIN",
+                "API_Status": "Success",
+            }
+        err_msg = response.text
+        if "CYTO_IPSSR" in err_msg:
+            err_msg = "缺少必填的 CYTO_IPSSR (細胞遺傳學)。官方 API 不支援此欄位空白。"
+        return {**empty, "API_Status": f"Error {response.status_code}: {err_msg}"}
+    except requests.exceptions.Timeout:
+        return {**empty, "API_Status": f"逾時 (>{API_TIMEOUT}s)，已重試 {API_MAX_RETRIES} 次仍失敗"}
+    except requests.exceptions.RequestException as e:
+        return {**empty, "API_Status": f"連線錯誤: {e}"}
+    except (KeyError, ValueError) as e:
+        return {**empty, "API_Status": f"回應格式錯誤: {e}"}
+
 
 def calculate_ipssm_via_api(cleaned_df):
-    results = []
+    """以執行緒池併發呼叫 API，保留原始列順序。"""
+    cleaned_df = cleaned_df.reset_index(drop=True)
+    row_dicts = cleaned_df.to_dict('records')
+    total_rows = len(row_dicts)
+    results = [None] * total_rows
     progress_bar = st.progress(0)
-    total_rows = len(cleaned_df)
-    
-    for index, row in cleaned_df.iterrows():
-        row_dict = row.to_dict()
-        payload = {}
-        for k, v in row_dict.items():
-            if k == 'ID' or v == 'NA':
-                continue
-            if k == 'CYTO_IPSSR' or k == 'TP53mut':
-                payload[k] = str(v)
-            else:
-                try: payload[k] = float(v) if '.' in str(v) else int(float(v))
-                except: payload[k] = str(v)
-                    
-        try:
-            response = requests.post("https://api.mds-risk-model.com/ipssm", json=payload, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                score_mean = data['ipssm']['means']['riskScore']
-                cat_mean = data['ipssm']['means']['riskCat']
-                score_best = data['ipssm']['best']['riskScore']
-                score_worst = data['ipssm']['worst']['riskScore']
-                range_score = score_worst - score_best
-                confidence = "CONFIDENT" if range_score < 1.0 else "UNCERTAIN"
-                
-                results.append({
-                    "IPSSMscore": score_mean, "IPSSMcat": cat_mean, 
-                    "IPSSMscore_best": score_best, "IPSSMscore_worst": score_worst,
-                    "Range_Score": round(range_score, 4), "Confidence_Level": confidence,
-                    "API_Status": "Success"
-                })
-            else:
-                # 若為細胞遺傳學錯誤，特製錯誤訊息
-                err_msg = response.text
-                if "CYTO_IPSSR" in err_msg:
-                    err_msg = "缺少必填的 CYTO_IPSSR (細胞遺傳學)。官方 API 不支援此欄位空白。"
-                results.append({
-                    "IPSSMscore": None, "IPSSMcat": None, "IPSSMscore_best": None, "IPSSMscore_worst": None,
-                    "Range_Score": None, "Confidence_Level": None, "API_Status": f"Error {response.status_code}: {err_msg}"
-                })
-        except Exception as e:
-            results.append({
-                "IPSSMscore": None, "IPSSMcat": None, "IPSSMscore_best": None, "IPSSMscore_worst": None,
-                "Range_Score": None, "Confidence_Level": None, "API_Status": str(e)
-            })
-            
-        progress_bar.progress((index + 1) / total_rows)
-        
+    done = 0
+
+    session = _build_api_session()
+    try:
+        with ThreadPoolExecutor(max_workers=min(API_MAX_WORKERS, max(total_rows, 1))) as executor:
+            future_to_idx = {
+                executor.submit(_call_api_for_row, session, rd): i
+                for i, rd in enumerate(row_dicts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+                done += 1
+                progress_bar.progress(done / total_rows)
+    finally:
+        session.close()
+
     res_df = pd.DataFrame(results)
-    final_df = pd.concat([cleaned_df.reset_index(drop=True), res_df], axis=1)
+    final_df = pd.concat([cleaned_df, res_df], axis=1)
     summary_df = final_df[['ID', 'Confidence_Level', 'API_Status']].copy()
-    
     return final_df, summary_df
 
 # ==========================================

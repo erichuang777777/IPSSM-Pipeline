@@ -19,6 +19,7 @@ import argparse
 import csv
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -73,8 +74,12 @@ COLUMN_ALIASES = {
     'BM_BLAST':    ['BM_BLAST', 'Blast', 'BM Blast', 'bone marrow blast', 'BM_Blast', 'Blast_BM', 'Blast_bm'],
     'del5q':       ['del5q', 'del(5q)', 'DEL5Q', 'Deletion 5q'],
     'del7_7q':     ['del7_7q', 'del(7)', 'del(7q)', 'DEL7', 'Deletion 7'],
+    'del17_17p':   ['del17_17p', 'del(17p)', 'del17p', 'DEL17P', '-17', 'Deletion 17p'],
+    'complex':     ['complex', 'complex_karyotype', 'Complex Karyotype', 'Complex'],
     'TP53loh':     ['TP53loh', 'TP53 LOH', 'TP53_LOH', 'TP53-LOH'],
     'TP53mut':     ['TP53mut', 'TP53', 'TP53_Mutation', 'TP53 mutation'],
+    'TP53maxvaf':  ['TP53maxvaf', 'TP53 VAF', 'TP53_VAF', 'TP53_maxVAF', 'TP53 maxVAF'],
+    'SF3B1':       ['SF3B1'],
     'BCOR':        ['BCOR'], 'BCORL1': ['BCORL1'], 'CEBPA': ['CEBPA'],
     'ETNK1':       ['ETNK1'], 'GATA2': ['GATA2'], 'GNB1': ['GNB1'],
     'IDH1':        ['IDH1'], 'NF1': ['NF1'], 'PHF6': ['PHF6'],
@@ -92,15 +97,14 @@ COLUMN_ALIASES = {
     'IPSS_M_':     ['IPSS_M_', 'IPSS_M', 'IPSSM', 'IPSS-M'],
 }
 
-# cohort converter 使用的標準欄位 (42 欄，與 STANDARD_COLUMNS 略有不同排列)
-STANDARD_IPSSM_COLUMNS = [
-    'ID', 'HB', 'PLT', 'BM_BLAST', 'del5q', 'del7_7q', 'TP53loh', 'TP53mut',
-    'BCOR', 'BCORL1', 'CEBPA', 'ETNK1', 'GATA2', 'GNB1', 'IDH1', 'NF1',
-    'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'SETBP1', 'STAG2', 'WT1',
-    'FLT3', 'MLL_PTD', 'SF3B1_5q', 'NPM1', 'RUNX1', 'NRAS', 'ETV6', 'IDH2',
-    'CBL', 'EZH2', 'U2AF1', 'SRSF2', 'DNMT3A', 'ASXL1', 'KRAS', 'SF3B1_alpha',
-    'CYTO_IPSSR', 'IPSS_M_'
-]
+# IPSS-M 交互作用/延伸欄位 (非核心 42 欄，但 R 模型可利用)。
+# cohort 轉換後以「附加欄」形式保留，不覆蓋 STANDARD_COLUMNS 主 schema。
+EXTRA_IPSSM_COLUMNS = ['SF3B1_5q', 'SF3B1_alpha', 'IPSS_M_']
+
+# cohort 轉換完成後應具備的完整欄位集 = 標準 42 欄 + 延伸欄位。
+# 注意: 過去的 STANDARD_IPSSM_COLUMNS 缺少 complex/del17_17p/TP53maxvaf/SF3B1，
+# 導致核型解析出的 complex/del17_17p 被切片丟棄 — 這裡改以聯集保留所有欄位。
+STANDARD_IPSSM_COLUMNS = STANDARD_COLUMNS + EXTRA_IPSSM_COLUMNS
 
 R_SCRIPT_TEMPLATE = r"""#!/usr/bin/env Rscript
 
@@ -497,14 +501,19 @@ def _try_convert_cohort(input_path, report):
                 for col in missing_cols:
                     df_converted[col] = 'NA'
 
-            df_converted = df_converted[STANDARD_IPSSM_COLUMNS]
+            # 依 STANDARD_IPSSM_COLUMNS 排序，但保留任何額外已算出的欄位(如核型解析的
+            # complex/del17_17p)，避免像舊版一樣被切片丟棄。
+            ordered = STANDARD_IPSSM_COLUMNS + [
+                c for c in df_converted.columns if c not in STANDARD_IPSSM_COLUMNS
+            ]
+            df_converted = df_converted[ordered]
             rows = df_converted.to_dict('records')
             fieldnames = list(df_converted.columns)
             report.add_conversion(f"Cohort type '{cohort_type}'", "Standard IPSSM format")
             return rows, fieldnames, True
 
-        rows, fieldnames = _read_input_file(input_path)
-        return rows, fieldnames, False
+        # 非 cohort 路徑: 直接重用已載入的 DataFrame，避免二次讀檔。
+        return df.to_dict('records'), list(df.columns), False
 
     except Exception as e:
         print(f"  [CONVERSION WARNING] Could not auto-detect cohort format: {e}")
@@ -548,6 +557,9 @@ def _validate_row(row_idx, row, report):
       5. 分類欄位 (CYTO_IPSSR, TP53mut) 檢查
     """
     patient_id = row.get('ID', f'Row{row_idx}')
+    # 記錄進入本列前的錯誤數，讓有效性判斷只依「本列」是否新增錯誤，
+    # 避免前面某列的錯誤導致其後所有正常病患被誤判為無效而遭丟棄。
+    errors_before = len(report.errors)
 
     # NA 標準化 (including ND -> NA for CYTO_IPSSR)
     for col, value in row.items():
@@ -601,7 +613,67 @@ def _validate_row(row_idx, row, report):
     if tp53 not in ('NA', '0', '1', '2', '2 or more'):
         report.add_error(row_idx, 'TP53mut', f"Invalid value: {tp53}")
 
-    return len(report.errors) == 0
+    # 只依本列是否新增錯誤來判定有效性 (見上方 errors_before)。
+    return len(report.errors) == errors_before
+
+
+def clean_dataframe(raw_df, collapse_tp53=False):
+    """
+    輕量級 DataFrame 清理，供 Streamlit API 引擎與其他呼叫端重用。
+
+    步驟:
+      1. 去除欄名尾部空格
+      2. 跳過缺少必填欄位 (HB/PLT/BM_BLAST) 的列 (記於 report.skipped_patients)
+      3. NA 標準化 (NA_STRINGS -> 'NA')
+      4. 對齊為 STANDARD_COLUMNS 42 欄
+      5. collapse_tp53=True 時，將 TP53mut 的 '2'/'>1'/'2 or more' 統一為 '2 or more'
+         (官方 REST API 需要此格式)
+
+    參數:
+        raw_df: 原始 pandas DataFrame
+        collapse_tp53: 是否將 TP53mut 折疊為 '2 or more' (API 引擎用)
+
+    回傳 (cleaned_df: DataFrame[STANDARD_COLUMNS], report: ValidationReport)
+    """
+    report = ValidationReport()
+    df = raw_df.astype(str)
+
+    # 1. 去除欄名尾部空格
+    rename_map = {col: col.strip() for col in df.columns if col != col.strip()}
+    if rename_map:
+        df = df.rename(columns=rename_map)
+        for src, dst in rename_map.items():
+            report.add_conversion(src, dst)
+
+    report.input_rows = len(df)
+    report.input_cols = len(df.columns)
+
+    valid_rows = []
+    for idx, row in df.iterrows():
+        row_dict = row.to_dict()
+        patient_id = str(row_dict.get('ID', f'Row{idx + 2}')).strip()
+
+        missing = [
+            f for f in REQUIRED_FIELDS
+            if str(row_dict.get(f, '')).strip() in NA_STRINGS
+        ]
+        if missing:
+            report.skip_patient(patient_id, f"Missing required field(s): {', '.join(missing)}")
+            continue
+
+        cleaned_row = {}
+        for col_name, value in row_dict.items():
+            clean_val = str(value).strip()
+            cleaned_row[col_name.strip()] = 'NA' if clean_val in NA_STRINGS else clean_val
+
+        if collapse_tp53 and cleaned_row.get('TP53mut') in ('2', '>1', '2 or more'):
+            cleaned_row['TP53mut'] = '2 or more'
+
+        valid_rows.append({col: cleaned_row.get(col, 'NA') for col in STANDARD_COLUMNS})
+
+    report.output_rows = len(valid_rows)
+    report.output_cols = len(STANDARD_COLUMNS)
+    return pd.DataFrame(valid_rows, columns=STANDARD_COLUMNS), report
 
 
 def run_screening(input_path, output_path, log_path):
@@ -638,8 +710,15 @@ def run_screening(input_path, output_path, log_path):
                 (k.strip() if k else k): (v.strip() if isinstance(v, str) else v)
                 for k, v in row.items()
             }
+            errors_before = len(report.errors)
             if _validate_row(row_idx, cleaned, report):
                 valid_rows.append(cleaned)
+            else:
+                # 有錯誤的列不進 R 計算，但明確記錄為 SKIP(而非靜默丟棄)，
+                # 且不影響其他正常病患。
+                new_errors = report.errors[errors_before:]
+                reason = new_errors[0] if new_errors else "Validation error"
+                report.skip_patient(cleaned.get('ID', f'Row{row_idx}'), reason)
 
         final_rows = []
         for row in valid_rows:
@@ -665,7 +744,9 @@ def run_screening(input_path, output_path, log_path):
 
         print(f"  [OK] Cleaned CSV: {output_path}")
         print(f"  [OK] 驗證日誌:    {log_path}")
-        return len(report.errors) == 0
+        # 只要有任何有效輸出列即視為成功；有問題的列已被記錄為 SKIP，
+        # 不再因單筆錯誤而讓整批作廢。
+        return report.output_rows > 0
 
     except Exception as e:
         print(f"  [ERROR] ERROR: {e}")
@@ -679,7 +760,19 @@ def run_screening(input_path, output_path, log_path):
 # ============================================================================
 
 def _find_rscript():
-    """自動尋找 Rscript 路徑 (Windows 搜尋常見安裝路徑)"""
+    """自動尋找 Rscript 路徑 (跨平台: 環境變數 > PATH > 常見安裝路徑)"""
+    # 1. 明確覆寫 (最高優先)
+    override = os.environ.get('IPSSM_RSCRIPT')
+    if override and Path(override).exists():
+        return override
+
+    # 2. PATH 搜尋 (posix 與 Windows 皆適用)
+    for name in ('Rscript', 'Rscript.exe'):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    # 3. 常見 Windows 安裝路徑後備
     candidates = [
         r"C:\Program Files\R\R-4.5.2\bin\Rscript.exe",
         r"C:\Program Files\R\R-4.4.2\bin\Rscript.exe",
@@ -688,9 +781,6 @@ def _find_rscript():
     for c in candidates:
         if Path(c).exists():
             return c
-    result = subprocess.run(['where', 'Rscript.exe'], capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip().split('\n')[0]
     return None
 
 
@@ -921,7 +1011,7 @@ def main():
     screen_ok = run_screening(input_path, cleaned_csv, log_path)
 
     if not screen_ok:
-        print("\n  [ERROR] 驗證階段有錯誤，請檢查日誌。")
+        print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
         sys.exit(1)
 
     if args.screen_only:

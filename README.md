@@ -51,10 +51,25 @@ python ipssm_pipeline.py data.xlsx -v validation.xlsx
 
 > 詳見 [SCREENER_REFERENCE.md](SCREENER_REFERENCE.md) 了解完整欄位規格、函數說明、與核型解析規則。
 
+## 驗證行為 (v2)
+
+- **逐列獨立驗證**：某一列有錯誤時，只會將「該列」標記為 SKIP 並記錄原因，
+  **不會**影響其他正常病患，也不會讓整批作廢。只有在 0 筆有效資料時才回報失敗。
+- **核型欄位保留**：cohort 自動轉換時，由核型解析出的 `complex` / `del17_17p`
+  等欄位會完整帶入輸出，不再被丟棄。
+
+## 測試
+
+```bash
+pip install -r requirements.txt pytest
+pytest -q          # 純 Python 測試，不需 R 或網路
+```
+
 ## 環境需求
 
-- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`）
+- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`, `requests`；測試另需 `pytest`）
 - **R** ≥ 4.3.0（需安裝 `ipssm` 套件）
+- Rscript 路徑可用環境變數 `IPSSM_RSCRIPT` 覆寫（跨平台自動偵測）
 
 ## 專案結構
 

@@ -207,12 +207,13 @@ Screener 能自動偵測不同醫院的資料格式，並轉換為標準 IPSSM �
     └─ 修復欄名尾部空格
     │
     ▼
-[3] _validate_row() (逐列)
+[3] _validate_row() (逐列，錯誤僅影響該列)
     ├─ NA 標準化 (ND → NA)
     ├─ 必填欄位檢查 → 缺失則 SKIP
-    ├─ 數值範圍檢查 → 超出則 ERROR
-    ├─ 二元欄位檢查 → 非 0/1 則 ERROR
-    └─ 分類欄位檢查 → 無效值則 ERROR
+    ├─ 數值範圍檢查 → 超出則 ERROR → 該列 SKIP
+    ├─ 二元欄位檢查 → 非 0/1 則 ERROR → 該列 SKIP
+    └─ 分類欄位檢查 → 無效值則 ERROR → 該列 SKIP
+    (註: 有錯誤的列只跳過自己並記錄原因，不影響其他病患，也不讓整批失敗)
     │
     ▼
 [4] 輸出 cleaned.csv + screening_log.txt
