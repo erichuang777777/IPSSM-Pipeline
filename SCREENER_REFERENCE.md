@@ -126,7 +126,8 @@ Screener 能自動偵測不同醫院的資料格式，並轉換為標準 IPSSM �
 ### 5.1 偵測邏輯
 - **FJUH**: 含 `ethnicity`, `diagnosis`, `karyotype` 欄位
 - **HSCT**: 含 `transplant`, `graft`, `donor`, `conditioning` 欄位
-- **UNKNOWN**: 直接嘗試標準欄位對應
+- **UNKNOWN**: 沒有上述特徵欄 — 僅為報告用的描述性標籤，**仍會嘗試**標準欄位對應
+  (v2 起不再限定只有偵測到 FJUH/HSCT 才轉換；任何檔案只要有可用的別名對應就會轉換)
 
 ### 5.2 欄位別名對照 (部分)
 
@@ -139,6 +140,35 @@ Screener 能自動偵測不同醫院的資料格式，並轉換為標準 IPSSM �
 | `CYTO_IPSSR` | `CYTO_IPSS-R`, `CYTO IPSS-R`, `Cytogenetic IPSS-R` |
 
 > 完整對照表請參見 `ipssm_pipeline.py` 中的 `COLUMN_ALIASES` 字典。
+
+### 5.3 正規化比對規則 (v2)
+
+比對欄名時會先正規化 (`_normalize_header`)：轉大寫、去除空白/底線/連字號/句點/斜線，
+並在括號內容「整段看起來像檢驗單位」時移除該括號內容。例如：
+
+| 來源欄名 | 正規化後 | 對應到 |
+|----------|----------|--------|
+| `Hemoglobin (g/dL)` | `HEMOGLOBIN` | `HB` |
+| `BM Blast (%)` | `BMBLAST` | `BM_BLAST` |
+| `Platelet_count` | `PLATELETCOUNT` | `PLT` |
+| `del(5q)` | `DEL5Q` | `del5q` (括號內容 `5q` 不是單位，會被保留) |
+
+僅做規則式的正規化比對，**不做模糊/相似度比對**，避免誤判。
+
+### 5.4 `--inspect` 唯讀欄位掃描預覽
+
+不確定來源檔案欄名能否自動對應時，可先執行唯讀預覽(不寫任何輸出檔、不驗證、不計算)：
+
+```bash
+python ipssm_pipeline.py data.xlsx --inspect
+```
+
+會回報：
+- **確定匹配**的欄位對應
+- **必填欄位缺失**(`HB`/`PLT`/`BM_BLAST` 未匹配 → 該病患會被跳過)
+- **選填欄位缺失**(其餘標準欄位未匹配 → 安全填為 `NA`)
+- 來源檔案中**未對應到任何標準欄位**的欄名(可能是無關的中繼資料，也可能是別名表未收錄的欄位)
+- `HB` 的**單位健檢**提示(數值中位數明顯偏高時，提示可能是 g/L 而非 g/dL；僅提示不自動轉換)
 
 ---
 
@@ -166,8 +196,11 @@ Screener 能自動偵測不同醫院的資料格式，並轉換為標準 IPSSM �
 
 | 函數 | 參數 | 回傳 | 說明 |
 |------|------|------|------|
-| `detect_cohort_type(df)` | DataFrame | `str` | 偵測隊列來源 (FJUH/HSCT/UNKNOWN) |
-| `find_column_mapping(input_df)` | DataFrame | `dict` | 根據別名表對應欄位名稱 |
+| `detect_cohort_type(df)` | DataFrame | `str` | 偵測隊列來源 (FJUH/HSCT/UNKNOWN，僅供參考標籤) |
+| `find_column_mapping(input_df)` | DataFrame | `dict` | 根據別名表(正規化比對)對應欄位名稱 |
+| `_normalize_header(name)` | 欄名字串 | `str` | 正規化欄名以供比對(去單位括號/底線/空白/大小寫) |
+| `inspect_columns(input_path)` | 檔案路徑 | `dict` | 唯讀掃描，回報 matched/missing/unmapped 欄位分類 |
+| `print_inspect_report(result)` | `inspect_columns()` 的回傳值 | — | 將掃描結果印成人類可讀報告 |
 
 ### 6.4 R 計算函數
 
