@@ -12,6 +12,9 @@ python ipssm_pipeline.py data.xlsx
 python ipssm_pipeline.py data.xlsx --screen-only      # 僅驗證
 python ipssm_pipeline.py cleaned.csv --translate-only  # 僅 R 計算
 
+# 缺失值: 跳過 或 補平均 (預設 impute)
+python ipssm_pipeline.py data.xlsx --missing skip
+
 # 帶驗證比對
 python ipssm_pipeline.py data.xlsx -v validation.xlsx
 
@@ -37,6 +40,33 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
 > 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
 > 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
 
+## 缺失值處理：跳過 或 補平均
+
+病患資料常有缺漏。執行時用 `--missing` 選擇處理方式：
+
+| 模式 | 作法 | 適用情境 |
+|---|---|---|
+| `skip` | 任何**模型輸入欄位**缺失的病患一律跳過，只計算資料完整者 | 要求結果完全建立在實測資料上 |
+| `impute`（預設） | 保留 `NA`，由官方 R 套件做 Best / Mean / Worst 三情境分析；**Mean 情境 = 以族群平均值（HB、PLT…）/ 平均突變頻率（基因）補值** | 想盡量保留病患，並看出缺失造成的不確定性 |
+
+```bash
+python ipssm_pipeline.py data.xlsx --missing skip
+python ipssm_pipeline.py data.xlsx --missing impute
+```
+
+重點規則：
+
+- **空白 = `NA` = `ND` 等**：一律視為「未知」，沒有差別。
+- **未知 ≠ `0`**：`0` 代表「檢測過、沒有突變」。基因欄位若把未檢測誤填成 `0`，會低估風險。
+- **請勿自行手動補平均值再送入**：手動補值會讓程式以為資料完整、範圍縮小而誤判為 CONFIDENT；
+  請保留空白/`NA` 讓程式處理，缺失才會被正確標記與量化。
+- 「模型輸入欄位」= 臨床（HB/PLT/BM_BLAST）、細胞遺傳學（del5q/del7_7q/del17_17p/complex/CYTO_IPSSR）、
+  `TP53mut`，以及 30 個基因欄位（`MLL_PTD`、`FLT3` 與 28 個突變基因，見 SCREENER_REFERENCE）。`TP53maxvaf`/`TP53loh` 只有在
+  `TP53mut = 1` 且無法判定 multi-hit 時才算缺失。
+- 輸出的 `Reported_Score` / `Reported_Cat` 一律是 **Mean 情境**結果；`IPSSMscore_best` /
+  `IPSSMscore_worst` 是缺失值最有利/最不利時的範圍；`Missing_Fields` / `Missing_Groups`
+  列出每位病患實際缺了什麼（clinical / cytogenetic / tp53 / genes）。
+
 ## 流程說明
 
 ```
@@ -46,7 +76,7 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
 [階段 1] 資料驗證 & 格式轉換
     ├─ 自動偵測隊列格式 (FJUH / HSCT / 自訂)
     ├─ 自動解析核型字符串 (Karyotype → 細胞遺傳學欄位)
-    ├─ 必填欄位檢查 (HB, PLT, BM_BLAST)
+    ├─ 缺失值處理 (--missing skip | impute)
     ├─ NA 標準化 & 數值範圍驗證
     ├─ 產出: *_cleaned.csv + *_screening_log.txt
     │
@@ -58,7 +88,7 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
     │
     ▼
 最終輸出 Excel
-    ├─ Summary:       ID + Confidence_Level
+    ├─ Summary:       ID + Reported_Score/Cat + Confidence_Level + Missing_Fields
     ├─ R_Full_Output:  完整 R 計算數據 (65 欄)
     └─ Analysis:       與手動驗證結果比對
 ```
@@ -67,8 +97,8 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
 
 | 條件 | 標記 | 意義 |
 |------|------|------|
-| Range < 1 | **CONFIDENT** ✅ | 缺失數據影響小，Mean 分數可信 |
-| Range ≥ 1 | **UNCERTAIN** ⚠️ | 缺失關鍵數據，結果跨多個風險類別 |
+| Range ≤ 1 | **CONFIDENT** ✅ | 缺失數據影響小，Mean 分數可信 |
+| Range > 1 | **UNCERTAIN** ⚠️ | 缺失關鍵數據，結果跨多個風險類別 |
 
 > 詳見 [SCREENER_REFERENCE.md](SCREENER_REFERENCE.md) 了解完整欄位規格、函數說明、與核型解析規則。
 

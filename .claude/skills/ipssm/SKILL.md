@@ -94,13 +94,38 @@ Decide what to do next:
 - Never silently proceed past a missing required field without telling the user —
   those patients get dropped from the results.
 
+## Step 1.6 — Ask how to handle missing values (always ask)
+
+Real cohorts have gaps. Before running, ask the user (use `AskUserQuestion`) which
+policy to apply, unless they already stated it:
+
+- **`skip`** — skip every patient that has any missing *model input* field; only
+  complete patients are scored.
+- **`impute`** — keep patients with gaps; the official R package runs Best / Mean / Worst
+  scenarios. The **Mean scenario fills with population means** (HB 9.87, mean mutation
+  frequency per gene, …) and is what `Reported_Score` / `Reported_Cat` show. Wide
+  Best–Worst ranges are flagged `UNCERTAIN`.
+
+If `--inspect` or the screening log shows many gaps, tell the user roughly how many
+patients each choice affects (skip drops them; impute keeps them but flags uncertainty)
+so the choice is informed. Pass the answer as `--missing skip|impute`.
+
+Semantics to state when relevant:
+- Blank, `NA`, `ND`, `N/A` … are all the same thing: **unknown**.
+- Unknown is **not** `0`. `0` means "tested, no mutation". Do not let users fill unknown
+  gene cells with `0`, and do not pre-fill means by hand — both hide uncertainty (a
+  hand-filled mean looks complete and gets marked CONFIDENT).
+- `TP53maxvaf` / `TP53loh` only count as missing when `TP53mut = 1` and multi-hit cannot
+  be determined (VAF > 0.55, `del17_17p = 1`, or known `TP53loh`).
+
 ## Step 2 — Run
 
 Full flow (validate → R risk calc → Excel):
 ```bash
-python3 ipssm_pipeline.py <input.csv|xlsx>
+python3 ipssm_pipeline.py <input.csv|xlsx> --missing skip      # or --missing impute
 ```
 Useful flags:
+- `--missing skip|impute` — missing-value policy (see Step 1.6; default `impute`).
 - `--screen-only` — just validate + clean, no R (fast sanity check of the input).
 - `--translate-only` — input is an already-cleaned CSV; only run R.
 - `-v validation.xlsx` — compare results against a manual validation sheet (adds an
@@ -113,17 +138,22 @@ Outputs are written next to the input file:
 - `<stem>_cleaned.csv` — the validated 42-column input that went into R.
 - `<stem>_screening_log.txt` — validation report (auto-fixes, skipped patients, errors).
 - `<stem>_cleaned_results.xlsx` — **the deliverable**, with sheets:
-  - `Summary` — `ID` + `Confidence_Level` (UNCERTAIN rows highlighted red).
-  - `R_Full_Output` — full R scores/categories per patient.
+  - `Summary` — `ID`, `Reported_Score`, `Reported_Cat`, `Confidence_Level`,
+    `Missing_Fields` (UNCERTAIN rows highlighted red).
+  - `R_Full_Output` — full R output per patient, incl. `IPSSMscore_best/mean/worst`,
+    `Range_Score`, `Used_Scenario_Analysis`, `Missing_Fields`, `Missing_Groups`
+    (clinical / cytogenetic / tp53 / genes).
   - `Analysis` — only when `-v` was supplied.
 
 Then:
 1. Read the screening log and the console summary; tell the user how many patients
-   **passed**, how many were **SKIPPED** (and why — e.g. missing HB/PLT/BM_BLAST), and
-   the **CONFIDENT vs UNCERTAIN** counts.
-2. Explain confidence: `Range = IPSSMscore_worst − IPSSMscore_best`; `Range < 1` →
-   **CONFIDENT**, `≥ 1` → **UNCERTAIN** (missing key data spans multiple risk
-   categories — interpret with care).
+   **passed**, how many were **SKIPPED** (and why — in `skip` mode, which fields were
+   missing), how many had missing values scored via the Mean scenario (`impute` mode),
+   and the **CONFIDENT vs UNCERTAIN** counts.
+2. Explain confidence: `Range = IPSSMscore_worst − IPSSMscore_best`; `Range ≤ 1` →
+   **CONFIDENT**, `> 1` → **UNCERTAIN** (missing key data spans multiple risk
+   categories — interpret `Reported_Score` with care and look at best/worst).
+   Note: CONFIDENT does not mean "no missing data" — check `Missing_Fields`.
 3. Hand the results Excel to the user with `SendUserFile` (the `<stem>_cleaned_results.xlsx`).
 
 ## Data & compliance (state briefly to the user)

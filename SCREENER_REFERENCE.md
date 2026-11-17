@@ -9,13 +9,13 @@
 
 ### 1.1 必填欄位 (Required Fields)
 
-缺少以下欄位的資料列會被 **直接跳過 (SKIP)**，不會進入 R 計算。
+這三欄缺失時的處理由 `--missing` 決定：`skip` 模式會 **跳過 (SKIP)** 該病患；`impute` 模式保留 `NA`，由 R 套件以 Mean 情境補值 (HB 平均 9.87、PLT/BLAST 以族群平均補值)，並在輸出中標記 `Missing_Groups = clinical`。
 
 | 欄位 | 全名 | 類型 | 有效範圍 | 單位 | 缺失處理 |
 |------|------|------|----------|------|----------|
-| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | ❌ 不可缺失 → 跳過該筆 |
-| `PLT` | Platelet count | float | 0 ~ 2000 | ×10⁹/L | ❌ 不可缺失 → 跳過該筆 |
-| `BM_BLAST` | Bone marrow blast % | float | 0 ~ 30 | % | ❌ 不可缺失 → 跳過該筆 |
+| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 以 Mean 情境補值 |
+| `PLT` | Platelet count | float | 0 ~ 2000 | ×10⁹/L | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
+| `BM_BLAST` | Bone marrow blast % | float | 0 ~ 30 | % | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
 
 > ⚠️ **HB 單位注意**: IPSS-M 標準為 **g/dL**。若您的資料使用 g/L，需先除以 10 再輸入。
 
@@ -86,8 +86,8 @@ Screener 會將以下字串**自動統一轉換為標準的 `NA`**：
 | 公式 | 結果 | 意義 |
 |------|------|------|
 | `Range = Worst - Best` | — | 最悲觀與最樂觀情境之間的差距 |
-| `Range < 1` | ✅ **CONFIDENT** | 缺失數據影響小，Mean 分數可信 |
-| `Range ≥ 1` | ⚠️ **UNCERTAIN** | 缺失關鍵數據，結果可能跨多個風險類別 |
+| `Range ≤ 1` | ✅ **CONFIDENT** | 缺失數據影響小，Mean 分數可信 |
+| `Range > 1` | ⚠️ **UNCERTAIN** | 缺失關鍵數據，結果可能跨多個風險類別 |
 
 ---
 

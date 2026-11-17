@@ -46,6 +46,29 @@ STANDARD_COLUMNS = [
 
 REQUIRED_FIELDS = {'HB', 'PLT', 'BM_BLAST'}
 
+# 缺失值處理模式:
+#   skip   - 任何「模型輸入欄位」缺失的病患一律跳過，只計算資料完整者
+#   impute - 保留 NA，由官方 R 套件做 Best/Mean/Worst 情境分析
+#            (Mean 情境 = 以族群平均值/平均突變頻率補值)
+MISSING_MODES = ('skip', 'impute')
+DEFAULT_MISSING_MODE = 'impute'
+
+# 缺失欄位分組 (用於輸出 Missing_Groups)
+CLINICAL_FIELDS = ['HB', 'PLT', 'BM_BLAST']
+CYTOGENETIC_FIELDS = ['del5q', 'del7_7q', 'del17_17p', 'complex', 'CYTO_IPSSR']
+GENE_FIELDS = [
+    'MLL_PTD', 'FLT3', 'ASXL1', 'CBL', 'DNMT3A', 'ETV6', 'EZH2', 'IDH2', 'KRAS',
+    'NPM1', 'NRAS', 'RUNX1', 'SF3B1', 'SRSF2', 'U2AF1',
+    # 殘餘基因 (R 套件以 Nres2 一般化公式處理缺失)
+    'BCOR', 'BCORL1', 'CEBPA', 'ETNK1', 'GATA2', 'GNB1', 'IDH1', 'NF1',
+    'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'SETBP1', 'STAG2', 'WT1',
+]
+# TP53mut 一律需要; TP53maxvaf / TP53loh 只有在無法判定 TP53 multi-hit 時才算缺失
+TP53_FIELDS = ['TP53mut', 'TP53maxvaf', 'TP53loh']
+
+# TP53mut 的各種寫法統一為 R 套件唯一接受的 '2 or more'
+TP53_MULTI_ALIASES = {'2', '>1', '2+', '2 or more'}
+
 NA_STRINGS = {
     '', ' ', 'NA', 'N/A', 'n/a', 'na', 'NaN', 'nan', 'None', 'none', '.', 'ND', 'nd'
 }
@@ -107,61 +130,31 @@ EXTRA_IPSSM_COLUMNS = ['SF3B1_5q', 'SF3B1_alpha', 'IPSS_M_']
 STANDARD_IPSSM_COLUMNS = STANDARD_COLUMNS + EXTRA_IPSSM_COLUMNS
 
 R_SCRIPT_TEMPLATE = r"""#!/usr/bin/env Rscript
+# 呼叫官方 R 套件 ipssm (papaemmelab/ipssm)。
+# 輸入 CSV 中的缺失值 (空白 / NA) 一律視為 NA，套件會同時計算 Best / Mean / Worst
+# 三種情境: Best = 缺失視為最有利、Worst = 缺失視為最不利、
+# Mean = 以族群平均值 (連續變數) / 平均突變頻率 (基因) 補值。
+# 缺失欄位清單與補值模式相關資訊由 Python 端 (ipssm_pipeline.py) 另外加上。
+# 套件位置: 沿用 R 預設的 library 路徑 (或環境變數 R_LIBS_USER)。
 
 args <- commandArgs(trailingOnly=TRUE)
-input_csv    <- args[1]
-output_csv   <- args[2]
+input_csv  <- args[1]
+output_csv <- args[2]
 
-# Setup library paths (雲端 + 本地 Windows)
-lib_candidates <- c(
-  path.expand("~/R/library"),
-  path.expand("~/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5"),
-  path.expand("~/AppData/Local/R/win-library/4.5"),
-  "C:/Users/user/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/R/win-library/4.5",
-  "C:/Users/user/AppData/Local/R/win-library/4.5"
-)
-
-for (lib_path in lib_candidates) {{
-  if (dir.exists(lib_path)) .libPaths(c(lib_path, .libPaths()))
-}}
-
-suppressPackageStartupMessages({{
+suppressPackageStartupMessages({
   library(ipssm, warn.conflicts=FALSE, verbose=FALSE)
-}})
+})
 
-# Read data and check for missing cytogenetic data
-data <- read.csv(input_csv, na.strings=c("", " ", "NA", "N/A", "n/a", "na", "NaN", "nan", "None", "none", ".", "ND", "nd"))
-
-# Detect patients with missing cytogenetic fields (scenario analysis triggered)
-cytogenetic_fields <- c("del5q", "del7_7q", "del17_17p", "CYTO_IPSSR")
-has_missing_cyto <- apply(data[, cytogenetic_fields, drop=FALSE], 1, function(x) any(is.na(x)))
-
-# Run IPSSMwrapper
 results <- IPSSMwrapper(input_csv)
 
-# Calculate range (worst_score - best_score) for confidence determination
-results$Range_Score <- results$IPSSMscore_worst - results$IPSSMscore_best
+# Range = Worst - Best; 與套件 IPSSMannotate 的門檻一致 (<= 1 視為可信)。
+# 先 round 到小數 2 位，避免浮點誤差使剛好等於 1 的情況被判錯。
+results$Range_Score <- round(results$IPSSMscore_worst - results$IPSSMscore_best, 2)
+results$Confidence_Level <- ifelse(results$Range_Score <= 1, "CONFIDENT", "UNCERTAIN")
 
-# Mark confidence level based on range
-results$Confidence_Level <- ifelse(results$Range_Score < 1, "CONFIDENT", "UNCERTAIN")
-
-# Mark if scenario analysis was used (missing cytogenetic data)
-results$Used_Scenario_Analysis <- ifelse(has_missing_cyto, "YES", "NO")
-
-# Add detail about which cytogenetic fields were missing
-results$Missing_Cytogenetic_Fields <- apply(
-  data[, cytogenetic_fields, drop=FALSE],
-  1,
-  function(x) {{
-    missing <- cytogenetic_fields[is.na(x)]
-    if (length(missing) > 0) paste(missing, collapse=", ") else "NONE"
-  }}
-)
-
-# Save results
 write.csv(results, file=output_csv, row.names=FALSE, na="NA")
 
-cat("\n[OK] Results generated with scenario analysis and confidence indicators\n")
+cat("\n[OK] Results generated with Best/Mean/Worst scenarios and confidence indicators\n")
 """
 
 
@@ -477,6 +470,8 @@ class ValidationReport:
         self.warnings = []
         self.auto_fixes = []
         self.skipped_patients = []
+        self.imputed_patients = []   # (patient_id, [missing fields]) — impute 模式下交給 R 補值者
+        self.missing_mode = DEFAULT_MISSING_MODE
         self.input_rows = 0
         self.output_rows = 0
         self.input_cols = 0
@@ -498,6 +493,9 @@ class ValidationReport:
     def skip_patient(self, patient_id, reason):
         self.skipped_patients.append(f"ID={patient_id}: {reason}")
 
+    def add_imputed(self, patient_id, fields):
+        self.imputed_patients.append((patient_id, list(fields)))
+
     def report(self):
         lines = [
             f"\nSummary: {len(self.errors)} ERRORS, {len(self.warnings)} WARNINGS, "
@@ -513,13 +511,23 @@ class ValidationReport:
             lines.append("\n--- INFO ---")
             lines.append(f"  [INFO] Input: {self.input_rows} rows x {self.input_cols} columns")
             lines.append(f"  [INFO] Output: {self.output_rows} rows x {self.output_cols} columns")
-            lines.append(f"  [INFO] Skipped: {len(self.skipped_patients)} patients with missing required fields")
+            lines.append(f"  [INFO] Missing-value mode: {self.missing_mode}")
+            lines.append(f"  [INFO] Skipped: {len(self.skipped_patients)} patients")
+            if self.missing_mode == 'impute':
+                lines.append(f"  [INFO] With missing values (mean-scenario imputation by R): "
+                             f"{len(self.imputed_patients)} patients")
         if self.skipped_patients:
             lines.append(f"\n--- SKIPPED PATIENTS ({len(self.skipped_patients)}) ---")
             for skip in self.skipped_patients[:20]:
                 lines.append(f"  [SKIP] {skip}")
             if len(self.skipped_patients) > 20:
                 lines.append(f"  ... and {len(self.skipped_patients) - 20} more")
+        if self.imputed_patients:
+            lines.append(f"\n--- PATIENTS WITH MISSING VALUES / IMPUTED ({len(self.imputed_patients)}) ---")
+            for pid, fields in self.imputed_patients[:20]:
+                lines.append(f"  [IMPUTE] ID={pid}: {', '.join(fields)}")
+            if len(self.imputed_patients) > 20:
+                lines.append(f"  ... and {len(self.imputed_patients) - 20} more")
         if self.auto_fixes:
             lines.append(f"\n--- AUTO-FIXES APPLIED ({len(self.auto_fixes)}) ---")
             for fix in self.auto_fixes[:30]:
@@ -670,7 +678,65 @@ def _convert_fjuh_format(rows, fieldnames, report):
     return converted
 
 
-def _validate_row(row_idx, row, report):
+def _is_na_value(value):
+    """判斷單一儲存格是否為缺失值 (含欄位根本不存在)。"""
+    if value is None:
+        return True
+    text = str(value).strip()
+    return text in NA_STRINGS or text == 'NA'
+
+
+def missing_model_fields(row):
+    """
+    回傳該病患「模型輸入欄位」中缺失的欄位名稱清單 (保持固定順序)。
+
+    - 臨床/細胞遺傳學/基因欄位: 為 NA 即缺失。
+    - TP53mut: 為 NA 即缺失。
+    - TP53maxvaf / TP53loh: 僅在 TP53mut == '1' 且無法判定 multi-hit
+      (TP53loh 非 0/1、maxvaf 也沒超過 0.55、也沒有 del17_17p) 時才算缺失；
+      TP53mut 為 0 或 '2 or more' 時兩者對結果沒有影響，不算缺失。
+      (邏輯對應 R 套件 IPSSMprocess 的 TP53multi 推導)
+    - SF3B1_5q / SF3B1_alpha / IPSS_M_ 由 R 套件自行推導，不列入。
+    """
+    missing = [f for f in CLINICAL_FIELDS + CYTOGENETIC_FIELDS
+               if _is_na_value(row.get(f))]
+
+    tp53mut = row.get('TP53mut')
+    if _is_na_value(tp53mut):
+        missing.append('TP53mut')
+    elif str(tp53mut).strip() == '1':
+        loh = row.get('TP53loh')
+        loh_known = not _is_na_value(loh) and str(loh).strip() in ('0', '1')
+        maxvaf = row.get('TP53maxvaf')
+        try:
+            vaf_high = not _is_na_value(maxvaf) and float(maxvaf) > 0.55
+        except ValueError:
+            vaf_high = False
+        del17p = str(row.get('del17_17p', '')).strip() == '1'
+        if not (loh_known or vaf_high or del17p):
+            missing.append('TP53loh')
+            if _is_na_value(maxvaf):
+                missing.append('TP53maxvaf')
+
+    missing += [f for f in GENE_FIELDS if _is_na_value(row.get(f))]
+    return missing
+
+
+def missing_groups(fields):
+    """將缺失欄位歸類為 clinical / cytogenetic / tp53 / genes，回傳以 ; 連接的字串。"""
+    groups = []
+    if any(f in CLINICAL_FIELDS for f in fields):
+        groups.append('clinical')
+    if any(f in CYTOGENETIC_FIELDS for f in fields):
+        groups.append('cytogenetic')
+    if any(f in TP53_FIELDS for f in fields):
+        groups.append('tp53')
+    if any(f in GENE_FIELDS for f in fields):
+        groups.append('genes')
+    return ';'.join(groups) if groups else 'NONE'
+
+
+def _validate_row(row_idx, row, report, missing_mode=DEFAULT_MISSING_MODE):
     """
     驗證單一資料列，回傳 True=有效 / False=跳過。
 
@@ -696,11 +762,24 @@ def _validate_row(row_idx, row, report):
                 row[col] = 'NA'
                 report.add_fix(row_idx, col, value, 'NA', 'Converted NA-like value to standard NA')
 
-    # 必填欄位檢查
-    missing = [f for f in REQUIRED_FIELDS if row.get(f, '').strip() in NA_STRINGS or row.get(f, '').strip() == '']
-    if missing:
-        report.skip_patient(patient_id, f"Missing required field(s): {', '.join(missing)}")
-        return False
+    # TP53mut 各種寫法統一 (R 套件只接受 '0' / '1' / '2 or more'，其餘會讓整批計算失敗)
+    tp53_raw = row.get('TP53mut')
+    if isinstance(tp53_raw, str) and tp53_raw.strip() in TP53_MULTI_ALIASES \
+            and tp53_raw.strip() != '2 or more':
+        row['TP53mut'] = '2 or more'
+        report.add_fix(row_idx, 'TP53mut', tp53_raw, '2 or more',
+                       "R package only accepts '2 or more' for >=2 TP53 mutations")
+
+    # 缺失值處理 (使用者選擇的模式)
+    missing = missing_model_fields(row)
+    if missing_mode == 'skip':
+        if missing:
+            report.skip_patient(
+                patient_id,
+                f"Missing value(s) [skip mode]: {', '.join(missing)}")
+            return False
+    # impute 模式: 保留 NA，交給 R 套件做 Best/Mean/Worst 情境分析
+    # (通過驗證後由 run_screening 記錄到 report.imputed_patients)
 
     # 數值範圍檢查
     for col in ['HB', 'PLT', 'BM_BLAST', 'TP53maxvaf']:
@@ -735,16 +814,20 @@ def _validate_row(row_idx, row, report):
     tp53 = row.get('TP53mut', 'NA')
     if isinstance(tp53, str):
         tp53 = tp53.strip()
-    if tp53 not in ('NA', '0', '1', '2', '2 or more'):
+    if tp53 not in ('NA', '0', '1', '2 or more'):
         report.add_error(row_idx, 'TP53mut', f"Invalid value: {tp53}")
 
     # 只依本列是否新增錯誤來判定有效性 (見上方 errors_before)。
     return len(report.errors) == errors_before
 
 
-def run_screening(input_path, output_path, log_path):
+def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSING_MODE):
     """
     執行資料驗證（第一階段），回傳是否成功。
+
+    missing_mode:
+      'skip'   - 任何模型輸入欄位缺失的病患一律跳過
+      'impute' - 保留 NA，交給 R 套件做 Best/Mean/Worst 情境分析 (預設)
 
     流程:
       1. 嘗試隊列格式轉換 (_try_convert_cohort)
@@ -759,7 +842,12 @@ def run_screening(input_path, output_path, log_path):
     print(f"  輸出:  {output_path}")
     print(f"  日誌:  {log_path}\n")
 
+    if missing_mode not in MISSING_MODES:
+        raise ValueError(f"missing_mode must be one of {MISSING_MODES}, got {missing_mode!r}")
+    print(f"  缺失值模式: {missing_mode}\n")
+
     report = ValidationReport()
+    report.missing_mode = missing_mode
     valid_rows = []
 
     try:
@@ -777,11 +865,15 @@ def run_screening(input_path, output_path, log_path):
                 for k, v in row.items()
             }
             errors_before = len(report.errors)
-            if _validate_row(row_idx, cleaned, report):
+            skipped_before = len(report.skipped_patients)
+            if _validate_row(row_idx, cleaned, report, missing_mode):
                 valid_rows.append(cleaned)
-            else:
+                still_missing = missing_model_fields(cleaned)
+                if still_missing:
+                    report.add_imputed(cleaned.get('ID', f'Row{row_idx}'), still_missing)
+            elif len(report.skipped_patients) == skipped_before:
                 # 有錯誤的列不進 R 計算，但明確記錄為 SKIP(而非靜默丟棄)，
-                # 且不影響其他正常病患。
+                # 且不影響其他正常病患。(已由 _validate_row 記錄 SKIP 者不重複記錄)
                 new_errors = report.errors[errors_before:]
                 reason = new_errors[0] if new_errors else "Validation error"
                 report.skip_patient(cleaned.get('ID', f'Row{row_idx}'), reason)
@@ -884,18 +976,20 @@ def _save_excel(r_results, output_path, validation_data=None):
 
     # --- Sheet 1: Summary ---
     ws = wb.create_sheet("Summary", 0)
-    ws.append(['ID', 'Confidence_Level'])
+    ws.append(['ID', 'Reported_Score', 'Reported_Cat', 'Confidence_Level', 'Missing_Fields'])
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
     for row in r_results:
-        ws.append([row.get('ID', ''), row.get('Confidence_Level', 'NA')])
+        ws.append([row.get('ID', ''), row.get('Reported_Score', 'NA'),
+                   row.get('Reported_Cat', 'NA'), row.get('Confidence_Level', 'NA'),
+                   row.get('Missing_Fields', '')])
         if row.get('Confidence_Level') == 'UNCERTAIN':
             for cell in ws[ws.max_row]:
                 cell.fill = uncertain_fill
                 cell.font = uncertain_font
-    ws.column_dimensions['A'].width = 12
-    ws.column_dimensions['B'].width = 16
+    for letter, width in zip('ABCDE', [12, 15, 16, 17, 40]):
+        ws.column_dimensions[letter].width = width
 
     # --- Sheet 2: R_Full_Output ---
     ws_r = wb.create_sheet("R_Full_Output", 1)
@@ -925,7 +1019,7 @@ def _save_excel(r_results, output_path, validation_data=None):
         for row in r_results:
             pid = row.get('ID', '')
             r_conf = row.get('Confidence_Level', 'NA')
-            r_cat = row.get('IPSSMcat', 'NA')
+            r_cat = row.get('Reported_Cat', row.get('IPSSMcat', 'NA'))
             r_range = row.get('Range_Score', 'NA')
             val = validation_data.get(pid, {})
             val_result = val.get('IPSS_M_', 'N/A') if val else 'N/A'
@@ -949,6 +1043,34 @@ def _save_excel(r_results, output_path, validation_data=None):
             ws_a.column_dimensions[letter].width = width
 
     wb.save(output_path)
+
+
+def _annotate_missing_info(r_results, cleaned_csv_path):
+    """
+    依清理後的輸入 CSV (與 R 輸出列順序一致) 為每位病患加上:
+      Missing_Fields / Missing_Groups / Used_Scenario_Analysis
+      Reported_Score / Reported_Cat  (= Mean 情境的分數與風險分類，即「補平均值」的結果)
+    缺失判定邏輯與 Screener 共用 (missing_model_fields)，不依賴 R。
+    """
+    with open(cleaned_csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        input_rows = list(csv.DictReader(f))
+
+    aligned = len(input_rows) == len(r_results)
+    if not aligned:
+        print(f"  [WARN] R 輸出列數 ({len(r_results)}) 與輸入列數 ({len(input_rows)}) 不一致，"
+              f"無法標記缺失欄位。")
+
+    for i, result in enumerate(r_results):
+        if aligned:
+            fields = missing_model_fields(input_rows[i])
+            result['Missing_Fields'] = ', '.join(fields) if fields else 'NONE'
+            result['Missing_Groups'] = missing_groups(fields)
+            result['Used_Scenario_Analysis'] = 'YES' if fields else 'NO'
+        else:
+            result['Missing_Fields'] = result['Missing_Groups'] = 'UNKNOWN'
+            result['Used_Scenario_Analysis'] = 'UNKNOWN'
+        result['Reported_Score'] = result.get('IPSSMscore_mean', 'NA')
+        result['Reported_Cat'] = result.get('IPSSMcat_mean', 'NA')
 
 
 def run_translation(input_csv, rscript_path=None, validation_path=None):
@@ -987,7 +1109,11 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
         cmd = [rscript, r_script_file, str(input_path), str(r_output_csv)]
 
         r_env = os.environ.copy()
-        r_env["R_LIBS_USER"] = os.path.expanduser("~/R/library")
+        # 只有在使用者沒設定 R_LIBS_USER、且 ~/R/library 存在時才補上，
+        # 避免覆寫 RStudio / 系統預設的 library 路徑。
+        user_lib = os.path.expanduser("~/R/library")
+        if "R_LIBS_USER" not in r_env and os.path.isdir(user_lib):
+            r_env["R_LIBS_USER"] = user_lib
         result = subprocess.run(cmd, capture_output=True, text=True, env=r_env)
 
         if result.stdout:
@@ -1010,6 +1136,7 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 
         print("  處理結果中...")
         r_results = _read_r_output(r_output_csv)
+        _annotate_missing_info(r_results, input_path)
 
         validation_data = {}
         if validation_path:
@@ -1017,16 +1144,18 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
 
         confident = sum(1 for r in r_results if r.get('Confidence_Level') == 'CONFIDENT')
         uncertain = sum(1 for r in r_results if r.get('Confidence_Level') == 'UNCERTAIN')
+        with_missing = sum(1 for r in r_results if r.get('Used_Scenario_Analysis') == 'YES')
 
         print(f"\n  === 信心等級統計 ===")
-        print(f"  CONFIDENT (range < 1):  {confident}")
-        print(f"  UNCERTAIN (range >= 1): {uncertain}")
+        print(f"  CONFIDENT (range <= 1): {confident}")
+        print(f"  UNCERTAIN (range > 1):  {uncertain}")
+        print(f"  含缺失值 (以 Mean 情境補值): {with_missing}")
         print(f"  總計: {len(r_results)}\n")
 
         _save_excel(r_results, excel_output, validation_data)
 
         print(f"  [OK] 結果已儲存: {excel_output}")
-        print(f"    Sheet 'Summary':       ID + Confidence_Level")
+        print(f"    Sheet 'Summary':       ID + 分數/分類 + Confidence_Level + 缺失欄位")
         print(f"    Sheet 'R_Full_Output':  完整 R 計算數據")
         if validation_data:
             print(f"    Sheet 'Analysis':      與驗證數據比對")
@@ -1048,6 +1177,10 @@ def main():
     parser.add_argument('input_file', help='輸入檔案（CSV 或 Excel）')
     parser.add_argument('-v', '--validation', help='手動驗證結果 Excel 檔案（比對用）')
     parser.add_argument('--rscript', help='Rscript 執行路徑')
+    parser.add_argument('--missing', choices=MISSING_MODES, default=DEFAULT_MISSING_MODE,
+                        help="缺失值處理: skip = 任何模型欄位缺失的病患一律跳過; "
+                             "impute = 保留 NA，由 R 套件以 Best/Mean/Worst 情境分析補值 "
+                             f"(預設 {DEFAULT_MISSING_MODE})")
     parser.add_argument('--screen-only', action='store_true', help='僅執行資料驗證，不執行 R 計算')
     parser.add_argument('--translate-only', action='store_true', help='僅執行 R 計算（輸入須為已清理的 CSV）')
     parser.add_argument('--inspect', action='store_true',
@@ -1081,7 +1214,7 @@ def main():
 
     cleaned_csv = input_path.parent / f"{input_path.stem}_cleaned.csv"
     log_path = input_path.parent / f"{input_path.stem}_screening_log.txt"
-    screen_ok = run_screening(input_path, cleaned_csv, log_path)
+    screen_ok = run_screening(input_path, cleaned_csv, log_path, missing_mode=args.missing)
 
     if not screen_ok:
         print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
