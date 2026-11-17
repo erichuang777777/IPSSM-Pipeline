@@ -6,7 +6,7 @@ description: Batch-calculate IPSS-M (Molecular International Prognostic Scoring 
 # IPSS-M Local Batch Scoring
 
 Run the local `ipssm_pipeline.py` to turn a patient CSV/Excel into IPSS-M risk
-scores + confidence levels. This replaces the Streamlit web-upload flow — everything
+scores + confidence levels. Everything
 runs on the user's machine via the official R `ipssm` package.
 
 ## When to use
@@ -53,10 +53,7 @@ Act on the result:
   ```
   (First install can take several minutes while it compiles dependencies.)
 
-Do **not** silently fall back to any web API — this skill is the local R engine.
-If the user explicitly wants the network REST API instead, that path still lives in
-`streamlit_app.py`. See **Engine consistency disclaimer** below before mixing results
-from the two.
+This skill is local-only: never fall back to any web API or upload patient data.
 
 ## Step 1.5 — Scan & confirm column mapping (messy / unfamiliar files)
 
@@ -129,29 +126,11 @@ Then:
    categories — interpret with care).
 3. Hand the results Excel to the user with `SendUserFile` (the `<stem>_cleaned_results.xlsx`).
 
-## Engine consistency disclaimer
-
-This skill exclusively uses the **local R engine** (`ipssm_pipeline.py` →
-official R `ipssm` package). The Streamlit web app additionally offers an
-**official REST API engine** (`api.mds-risk-model.com`). These are two
-**independently maintained implementations** of IPSS-M:
-- They may not stay version-synced, and are not guaranteed to produce
-  **numerically identical** scores even when both are given complete data.
-- The REST API additionally **requires** `CYTO_IPSSR` and errors on missing
-  cytogenetics, whereas the R engine runs scenario analysis (best/mean/worst)
-  for missing values — so results can differ for structural reasons too.
-- **Do not mix results from both engines** within the same report or cohort
-  analysis; always label which engine produced a given set of scores. If asked
-  to reconcile numbers between the CLI/skill output and the web app, treat
-  this as the expected difference, not a bug — check `README.md`'s "計算引擎
-  差異聲明" section for the full statement.
-
 ## Data & compliance (state briefly to the user)
 
 Per the MSKCC IPSS-M terms mirrored in `README.md`: data must be **de-identified**
 (no PHI), results are **for academic research only** — not for clinical diagnosis,
-treatment, or medical reports. The pipeline never transmits the `ID` column anywhere;
-the R engine runs fully locally.
+treatment, or medical reports. Nothing is transmitted anywhere; the R engine runs fully locally.
 
 ## Reference
 

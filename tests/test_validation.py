@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ipssm_pipeline import STANDARD_COLUMNS, run_screening, clean_dataframe
+from ipssm_pipeline import STANDARD_COLUMNS, run_screening
 
 import pandas as pd
 
@@ -90,20 +90,3 @@ def test_all_rows_invalid_returns_false(tmp_path):
 
     ok = run_screening(str(in_csv), str(out_csv), str(log))
     assert ok is False  # 0 有效輸出列 -> False
-
-
-def test_clean_dataframe_reusable():
-    df = pd.DataFrame([
-        _make_row('a'),
-        _make_row('b', HB='NA'),   # 缺必填 -> skip
-    ])
-    cleaned, report = clean_dataframe(df, collapse_tp53=True)
-    assert report.output_rows == 1
-    assert len(report.skipped_patients) == 1
-    assert list(cleaned.columns) == STANDARD_COLUMNS
-
-
-def test_clean_dataframe_collapses_tp53():
-    df = pd.DataFrame([_make_row('a', TP53mut='2')])
-    cleaned, _ = clean_dataframe(df, collapse_tp53=True)
-    assert cleaned.loc[0, 'TP53mut'] == '2 or more'

@@ -742,65 +742,6 @@ def _validate_row(row_idx, row, report):
     return len(report.errors) == errors_before
 
 
-def clean_dataframe(raw_df, collapse_tp53=False):
-    """
-    輕量級 DataFrame 清理，供 Streamlit API 引擎與其他呼叫端重用。
-
-    步驟:
-      1. 去除欄名尾部空格
-      2. 跳過缺少必填欄位 (HB/PLT/BM_BLAST) 的列 (記於 report.skipped_patients)
-      3. NA 標準化 (NA_STRINGS -> 'NA')
-      4. 對齊為 STANDARD_COLUMNS 42 欄
-      5. collapse_tp53=True 時，將 TP53mut 的 '2'/'>1'/'2 or more' 統一為 '2 or more'
-         (官方 REST API 需要此格式)
-
-    參數:
-        raw_df: 原始 pandas DataFrame
-        collapse_tp53: 是否將 TP53mut 折疊為 '2 or more' (API 引擎用)
-
-    回傳 (cleaned_df: DataFrame[STANDARD_COLUMNS], report: ValidationReport)
-    """
-    report = ValidationReport()
-    df = raw_df.astype(str)
-
-    # 1. 去除欄名尾部空格
-    rename_map = {col: col.strip() for col in df.columns if col != col.strip()}
-    if rename_map:
-        df = df.rename(columns=rename_map)
-        for src, dst in rename_map.items():
-            report.add_conversion(src, dst)
-
-    report.input_rows = len(df)
-    report.input_cols = len(df.columns)
-
-    valid_rows = []
-    for idx, row in df.iterrows():
-        row_dict = row.to_dict()
-        patient_id = str(row_dict.get('ID', f'Row{idx + 2}')).strip()
-
-        missing = [
-            f for f in REQUIRED_FIELDS
-            if str(row_dict.get(f, '')).strip() in NA_STRINGS
-        ]
-        if missing:
-            report.skip_patient(patient_id, f"Missing required field(s): {', '.join(missing)}")
-            continue
-
-        cleaned_row = {}
-        for col_name, value in row_dict.items():
-            clean_val = str(value).strip()
-            cleaned_row[col_name.strip()] = 'NA' if clean_val in NA_STRINGS else clean_val
-
-        if collapse_tp53 and cleaned_row.get('TP53mut') in ('2', '>1', '2 or more'):
-            cleaned_row['TP53mut'] = '2 or more'
-
-        valid_rows.append({col: cleaned_row.get(col, 'NA') for col in STANDARD_COLUMNS})
-
-    report.output_rows = len(valid_rows)
-    report.output_cols = len(STANDARD_COLUMNS)
-    return pd.DataFrame(valid_rows, columns=STANDARD_COLUMNS), report
-
-
 def run_screening(input_path, output_path, log_path):
     """
     執行資料驗證（第一階段），回傳是否成功。

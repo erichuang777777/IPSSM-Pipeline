@@ -34,8 +34,8 @@ skill 也附了一個從任意目錄都能執行的包裝腳本：
 bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only ...]
 ```
 
-> 引擎：skill 預設走**本地 R 引擎**（離線、支援缺細胞遺傳學的情境分析）。
-> 需連網的官方 REST API 引擎仍保留在 `streamlit_app.py` 的網頁版中。
+> 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
+> 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
 
 ## 流程說明
 
@@ -82,22 +82,10 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
   底線)能對到 `COLUMN_ALIASES`，無論是否偵測到已知的 FJUH/HSCT 特徵欄都會嘗試轉換。
   來源檔案欄名不確定時，建議先跑 `--inspect` 預覽對應結果，見上方「快速開始」。
 
-## ⚠️ 計算引擎差異聲明
+## 計算引擎
 
-本專案提供兩套**分別維護**的 IPSS-M 計算實作，兩者的計算規則、缺失資料處理方式不完全相同：
-
-| | R 引擎 (本地 `ipssm` 套件，CLI/skill 預設) | 官方 Web API (`api.mds-risk-model.com`，Streamlit 網頁版選項) |
-|---|---|---|
-| 執行方式 | 完全離線 | 需連網 |
-| 缺 `CYTO_IPSSR` | 支援情境分析 (Best/Mean/Worst + 信心等級) | **嚴格要求**，缺少會回傳 `Error 400` |
-| 版本同步 | 隨本專案/`ipssm` 套件版本 | 隨官方伺服器版本，可能不同步 |
-
-**即使兩邊輸入資料都完整，也不保證計算出的數值完全一致**（畢竟是兩套獨立維護的實作）。
-因此：
-- **請勿在同一份報告或同一批次分析中混用兩引擎的結果。**
-- 交付結果時，務必標明該筆分數是由哪個引擎產生（本地 R 引擎 或 官方 REST API）。
-- 若發現本機 CLI/skill 算出的分數與網頁 API 版本不同，這是**預期的引擎差異**，
-  不代表任一邊有 bug。
+只使用本地 R 引擎（官方 `ipssm` 套件的 `IPSSMwrapper`），完全離線，病患資料不會離開本機。
+缺失值（空白、`NA`、`ND` 等）一律標準化為 `NA`，由 R 套件做 Best / Mean / Worst 三情境分析。
 
 ## 測試
 
@@ -108,22 +96,20 @@ pytest -q          # 純 Python 測試，不需 R 或網路
 
 ## 環境需求
 
-- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`, `requests`；測試另需 `pytest`）
-- **R** ≥ 4.3.0（需安裝 `ipssm` 套件）
+- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`；測試另需 `pytest`）
+- **R** ≥ 4.3.0（需安裝 `ipssm` 套件，可執行 `Rscript install.R` 安裝）
 - Rscript 路徑可用環境變數 `IPSSM_RSCRIPT` 覆寫（跨平台自動偵測）
 
 ## 專案結構
 
 ```
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
-├── streamlit_app.py           # Streamlit 網頁介面
 ├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
-├── tests/                     # pytest 測試 (karyotype / validation / cohort / api)
+├── tests/                     # pytest 測試 (karyotype / validation / cohort)
 ├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
 ├── README.md                  # 本文件
 │
-├── install.R                  # Streamlit Cloud R 安裝腳本
-├── packages.txt               # Streamlit Cloud apt 依賴
+├── install.R                  # 本地安裝 ipssm R 套件
 ├── requirements.txt           # Python 依賴
 ├── .gitignore                 # Git 忽略規則
 │
@@ -145,12 +131,12 @@ pytest -q          # 純 Python 測試，不需 R 或網路
 
 ## 法律與合規注意事項 (Terms of Use / Compliance)
 
-開發與使用本系統需嚴格遵守 MSKCC (Memorial Sloan Kettering Cancer Center) 官方 IPSS-M API 使用條款。請注意以下限制：
+開發與使用本系統需嚴格遵守 MSKCC (Memorial Sloan Kettering Cancer Center) 官方 IPSS-M 使用條款。請注意以下限制：
 
 1. **🚫 絕對禁止用於臨床醫療與診斷**：
    本工具算出的分數 **僅限學術研究 (Academic Research) 參考使用**。嚴禁將計算結果用於真實病患之診斷、治療決策，或產生任何醫院的官方醫療報告。
 2. **🚫 禁止傳輸病患個資 (PHI/PII)**：
-   不得上傳含有「真實姓名」、「身分證字號」等足資辨識個人身分的Protected Health Information (PHI)。系統會自動過濾 `ID` 欄位不傳送至國外伺服器以保護隱私，但其餘欄位請確保皆已去識別化。
+   不得上傳含有「真實姓名」、「身分證字號」等足資辨識個人身分的Protected Health Information (PHI)。本工具完全在本機執行、不傳送資料，但輸入檔請確保已去識別化。
 3. **🚫 禁止商業用途**：
    嚴格禁止將此工具或產生之結果用於任何商業目的，除非已取得 MSK 之明示書面授權。
 4. **⚠️ 發表論文限制**：
