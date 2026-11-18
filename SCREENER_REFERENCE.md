@@ -13,7 +13,7 @@
 
 | 欄位 | 全名 | 類型 | 有效範圍 | 單位 | 缺失處理 |
 |------|------|------|----------|------|----------|
-| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 以 Mean 情境補值 |
+| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | 缺失 → `skip` 模式跳過該筆；`impute` / `auto` 模式交給 R 以 Mean 情境補值 |
 | `PLT` | Platelet count | float | 0 ~ 2000 | ×10⁹/L | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
 | `BM_BLAST` | Bone marrow blast % | float | 0 ~ 30 | % | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
 
@@ -63,19 +63,46 @@
 
 ---
 
-## 2. NA 標準化規則
+## 2. 缺失值與正規化規則
 
-Screener 會將以下字串**自動統一轉換為標準的 `NA`**：
+### 2.1 缺失 (未知)
+
+下列字串視為**未知**，統一轉成 `NA`（空白與 `NA` 完全等價，且**不等於 `0`**）：
 
 ```
-"", " ", "NA", "N/A", "n/a", "na",
-"NaN", "nan", "None", "none", ".", "ND", "nd"
+"", " ", "NA", "N/A", "n/a", "na", "NaN", "nan", "None", "none", "."
 ```
 
-### 2.1 特殊規則: `CYTO_IPSSR` 的 `ND`
-- `ND` (Not Detected/Not Done) 在 `CYTO_IPSSR` 欄位有特殊意義
-- 被明確轉換為 `NA`，觸發 R 情境分析
-- 會在驗證日誌中記錄為 `"Converted ND (not detected) to NA"`
+### 2.2 `ND` = Not Detected（有檢測、未偵測到）
+
+`ND` **不是缺失**。依欄位型態：
+
+| 欄位型態 | `ND` 的處理 |
+|---|---|
+| 二元欄位（基因、`del5q`、`del7_7q`、`del17_17p`、`complex`、`TP53loh`、`MLL_PTD`、`FLT3`）| → `0` |
+| `TP53mut` | → `0` |
+| 數值欄位（`HB`/`PLT`/`BM_BLAST`/`TP53maxvaf`）、`CYTO_IPSSR` | 無法對應成值 → `NA` |
+
+### 2.3 關鍵字 / 格式規則（每次改動都記錄於逐欄位稽核）
+
+| 規則 (`Rule`) | 範例 | 狀態 |
+|---|---|---|
+| `na_alias` | `""` → `NA` | auto_applied |
+| `nd_not_detected_to_0` / `nd_to_na` | `ND` → `0` / `NA` | auto_applied |
+| `binary_keyword` | `Positive`/`yes`/`mut` → 1；`neg`/`wt`/`wild-type` → 0 | auto_applied；`+`、`-`、`present`、`y`、`n` 等較模糊者為 needs_review |
+| `numeric_binary` | `1.0` → `1` | auto_applied |
+| `cyto_case_normalized` | `very_good` → `Very Good` | auto_applied |
+| `tp53mut_multi_alias` | `2`、`>1`、`2+` → `2 or more`（R 套件唯一接受的寫法）| auto_applied |
+| `strip_unit` | `9.6 g/dL` → `9.6`、`9%` → `9`、`281 K/uL` → `281` | auto_applied |
+| `unit_g_per_l_to_g_per_dl` | `96 g/L` → `9.6` | needs_review |
+| `decimal_comma` | `9,6` → `9.6` | needs_review |
+| `percent_to_fraction` / `vaf_percent_assumed` | `TP53maxvaf` `85%` / `85` → `0.85` | needs_review |
+| `llm_interpretation` | LLM 對應結果（見 README「LLM 輔助檢核」）| needs_review |
+| `unparsed` | 規則（及 LLM）都無法解析 | unresolved → 該病患排除 |
+
+稽核紀錄欄位：`Row, ID, Column, Original, Normalized, Rule, Source (rule/llm/llm_rejected),
+Status (auto_applied/needs_review/unresolved), Confidence, Note`，輸出為 `*_field_audit.csv`
+與 `*_review.xlsx` 的 `Field_Audit` 工作表。值本來就正確的儲存格不產生紀錄。
 
 ---
 
@@ -240,23 +267,26 @@ python ipssm_pipeline.py data.xlsx --inspect
     └─ 修復欄名尾部空格
     │
     ▼
-[3] _validate_row() (逐列，錯誤僅影響該列)
-    ├─ NA 標準化 (ND → NA)
-    ├─ 必填欄位檢查 → 缺失則 SKIP
+[3] _normalize_row() → _validate_row() (逐列，錯誤僅影響該列)
+    ├─ _normalize_cell(): 關鍵字/格式規則 + 逐欄位稽核 (選用 LLM 處理無法解析者)
+    ├─ skip 模式: 任何模型欄位缺失 → SKIP (impute / auto 保留 NA)
     ├─ 數值範圍檢查 → 超出則 ERROR → 該列 SKIP
     ├─ 二元欄位檢查 → 非 0/1 則 ERROR → 該列 SKIP
     └─ 分類欄位檢查 → 無效值則 ERROR → 該列 SKIP
     (註: 有錯誤的列只跳過自己並記錄原因，不影響其他病患，也不讓整批失敗)
     │
     ▼
-[4] 輸出 cleaned.csv + screening_log.txt
+[4] run_trial_calculation() → R IPSSMwrapper (Stage 2 試算)
+    ├─ Best/Mean/Worst、Range = Worst - Best
+    └─ auto 模式: Range > max_range 者排除，列入 UNCERTAIN 清單
     │
     ▼
-[5] run_translation() → R IPSSMwrapper
-    ├─ 三情境分析 (Best/Mean/Worst)
-    ├─ Range = Worst - Best
-    ├─ Confidence = CONFIDENT / UNCERTAIN
-    └─ 輸出 results.xlsx (多工作表)
+[5] 輸出 *_standardized.csv + *_review.xlsx + *_field_audit.csv + *_screening_log.txt
+    │   (停下來讓使用者核對)
+    ▼
+[6] run_translation() → R IPSSMwrapper (Stage 4 正式計算)
+    ├─ Confidence = CONFIDENT (Range ≤ 1) / UNCERTAIN (Range > 1)
+    └─ 輸出 *_standardized_results.xlsx (多工作表)
 ```
 
 ---

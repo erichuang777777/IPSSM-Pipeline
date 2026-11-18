@@ -50,8 +50,11 @@ REQUIRED_FIELDS = {'HB', 'PLT', 'BM_BLAST'}
 #   skip   - 任何「模型輸入欄位」缺失的病患一律跳過，只計算資料完整者
 #   impute - 保留 NA，由官方 R 套件做 Best/Mean/Worst 情境分析
 #            (Mean 情境 = 以族群平均值/平均突變頻率補值)
-MISSING_MODES = ('skip', 'impute')
+#   auto   - 先全部試算，缺失造成的風險範圍 (Worst-Best) 不超過 max_range 者補平均值
+#            計算；超過者列入 UNCERTAIN 清單並排除 (需要 R)
+MISSING_MODES = ('skip', 'impute', 'auto')
 DEFAULT_MISSING_MODE = 'impute'
+DEFAULT_MAX_RANGE = 1.0
 
 # 缺失欄位分組 (用於輸出 Missing_Groups)
 CLINICAL_FIELDS = ['HB', 'PLT', 'BM_BLAST']
@@ -69,8 +72,54 @@ TP53_FIELDS = ['TP53mut', 'TP53maxvaf', 'TP53loh']
 # TP53mut 的各種寫法統一為 R 套件唯一接受的 '2 or more'
 TP53_MULTI_ALIASES = {'2', '>1', '2+', '2 or more'}
 
+# 單一欄位缺失就足以讓 Worst-Best 範圍超過 1 (=> 必為 UNCERTAIN) 的欄位。
+# 依 ipssm 套件公式 |係數|*|worst-best|/ln2 計算並由 tests/test_r_integration.py 以 R 驗證。
+# 其餘欄位 (PLT、各基因…) 單獨缺失不會超過 1，但多個加總後可能超過。
+STRONG_MISSING_FIELDS = {
+    'HB', 'BM_BLAST', 'CYTO_IPSSR', 'TP53mut', 'TP53loh', 'TP53maxvaf', 'FLT3', 'MLL_PTD',
+}
+
+# ---- 正規化規則 (Stage 1) --------------------------------------------------
+# ND = Not Detected: 有檢測、未偵測到突變 => 二元/TP53mut 欄位視為 0。
+# 其他型態 (數值、CYTO_IPSSR) 無法對應成值，只能視為 NA。
+ND_ALIASES = {'nd', 'n.d.', 'n.d', 'not detected', 'not detect', 'notdetected'}
+
+# 二元欄位的文字寫法對照 (high = 可自動套用; medium = 套用但標記「需人工確認」)
+BINARY_TRUE_HIGH = {'1', 'yes', 'true', 'pos', 'positive', 'mutated', 'mut', 'mutant'}
+BINARY_FALSE_HIGH = {'0', 'no', 'false', 'neg', 'negative', 'wt', 'wildtype', 'wild type',
+                     'wild-type', 'not mutated', 'unmutated', 'absent'}
+BINARY_TRUE_MEDIUM = {'+', 'present', 'detected', 'y'}
+BINARY_FALSE_MEDIUM = {'-', '--', 'not present', 'n'}
+
+CYTO_CATEGORIES = ['Very Good', 'Good', 'Intermediate', 'Poor', 'Very Poor']
+CYTO_LOOKUP = {c.lower(): c for c in CYTO_CATEGORIES}
+
+NUMERIC_FIELDS = {'HB', 'PLT', 'BM_BLAST', 'TP53maxvaf'}
+# 各數值欄位可接受、可直接剝除的單位字串 (小寫)
+NUMERIC_UNITS_IGNORED = {
+    'HB': {'g/dl', 'gdl'},
+    'PLT': {'k/ul', 'k/µl', 'x10^9/l', '10^9/l', 'x10e9/l', 'giga/l', 'g/l', '/nl', '10*9/l'},
+    'BM_BLAST': {'%'},
+    'TP53maxvaf': set(),
+}
+
+
+def _field_kind(col):
+    """欄位的正規化型態: binary / cyto / tp53mut / number / None (非模型欄位)。"""
+    if col in BINARY_FIELDS:
+        return 'binary'
+    if col == 'CYTO_IPSSR':
+        return 'cyto'
+    if col == 'TP53mut':
+        return 'tp53mut'
+    if col in NUMERIC_FIELDS:
+        return 'number'
+    return None
+
+# 注意: 'ND' (not detected) 不在此集合 — 它代表「有檢測、未偵測到」，
+# 依欄位型態有不同的正規化 (見 _normalize_cell)，不是單純的缺失。
 NA_STRINGS = {
-    '', ' ', 'NA', 'N/A', 'n/a', 'na', 'NaN', 'nan', 'None', 'none', '.', 'ND', 'nd'
+    '', ' ', 'NA', 'N/A', 'n/a', 'na', 'NaN', 'nan', 'None', 'none', '.'
 }
 
 VALIDATION_RULES = {
@@ -83,7 +132,7 @@ VALIDATION_RULES = {
 }
 
 BINARY_FIELDS = {
-    'del5q', 'del7_7q', 'complex', 'del17_17p', 'MLL_PTD', 'FLT3', 'ASXL1',
+    'del5q', 'del7_7q', 'complex', 'del17_17p', 'TP53loh', 'MLL_PTD', 'FLT3', 'ASXL1',
     'BCOR', 'BCORL1', 'CBL', 'CEBPA', 'DNMT3A', 'ETV6', 'EZH2', 'IDH1', 'IDH2',
     'KRAS', 'NF1', 'NPM1', 'NRAS', 'RUNX1', 'SETBP1', 'SF3B1', 'SRSF2', 'STAG2',
     'U2AF1', 'ETNK1', 'GATA2', 'GNB1', 'PHF6', 'PPM1D', 'PRPF8', 'PTPN11', 'WT1'
@@ -462,15 +511,21 @@ def print_inspect_report(result):
 #  第一階段：資料驗證 (Screener)
 # ============================================================================
 
+AUDIT_COLUMNS = ['Row', 'ID', 'Column', 'Original', 'Normalized', 'Rule', 'Source',
+                 'Status', 'Confidence', 'Note']
+
+
 class ValidationReport:
-    """收集驗證過程中的錯誤、警告、自動修復和跳過記錄"""
+    """收集驗證過程中的錯誤、警告、逐欄位正規化紀錄、排除與補值資訊"""
 
     def __init__(self):
         self.errors = []
         self.warnings = []
-        self.auto_fixes = []
+        self.cell_audit = []         # 逐儲存格正規化紀錄 (dict, 欄位見 AUDIT_COLUMNS)
         self.skipped_patients = []
-        self.imputed_patients = []   # (patient_id, [missing fields]) — impute 模式下交給 R 補值者
+        self.excluded = []           # 結構化排除清單: ID / Row / Source / Reason
+        self.imputed_patients = []   # (patient_id, [missing fields]) — 交給 R 補值者
+        self.llm_results = []        # LLMResult 清單 (若啟用 LLM)
         self.missing_mode = DEFAULT_MISSING_MODE
         self.input_rows = 0
         self.output_rows = 0
@@ -484,22 +539,40 @@ class ValidationReport:
     def add_warning(self, row, col, msg):
         self.warnings.append(f"Row {row}, {col}: {msg}")
 
-    def add_fix(self, row, col, old_val, new_val, reason):
-        self.auto_fixes.append(f"Row {row}, {col}: '{old_val}' -> '{new_val}' ({reason})")
+    def add_audit(self, row, patient_id, column, original, normalized, rule,
+                  source='rule', status='auto_applied', confidence='', note=''):
+        self.cell_audit.append({
+            'Row': row, 'ID': patient_id, 'Column': column, 'Original': original,
+            'Normalized': normalized, 'Rule': rule, 'Source': source,
+            'Status': status, 'Confidence': confidence, 'Note': note,
+        })
 
     def add_conversion(self, source_col, target_col):
         self.format_conversions.append(f"{source_col} -> {target_col}")
 
-    def skip_patient(self, patient_id, reason):
+    def skip_patient(self, patient_id, reason, kind='validation', row=None):
+        """kind: validation (資料錯誤) / missing (skip 模式因缺失) / uncertain (auto 模式範圍過大)"""
         self.skipped_patients.append(f"ID={patient_id}: {reason}")
+        self.excluded.append({'ID': patient_id, 'Row': row, 'Source': kind, 'Reason': reason})
 
     def add_imputed(self, patient_id, fields):
         self.imputed_patients.append((patient_id, list(fields)))
 
+    def audit_counts(self):
+        """依 (Rule, Status) 統計稽核紀錄筆數。"""
+        counts = {}
+        for entry in self.cell_audit:
+            key = (entry['Rule'], entry['Status'])
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def report(self):
+        n_review = sum(1 for e in self.cell_audit if e['Status'] == 'needs_review')
+        n_unres = sum(1 for e in self.cell_audit if e['Status'] == 'unresolved')
         lines = [
             f"\nSummary: {len(self.errors)} ERRORS, {len(self.warnings)} WARNINGS, "
-            f"{len(self.auto_fixes)} AUTO-FIXES, {len(self.skipped_patients)} SKIPPED\n"
+            f"{len(self.cell_audit)} NORMALIZED CELLS ({n_review} need review, "
+            f"{n_unres} unresolved), {len(self.skipped_patients)} SKIPPED\n"
         ]
         if self.format_conversions:
             lines.append("\n--- FORMAT CONVERSIONS ---")
@@ -513,7 +586,7 @@ class ValidationReport:
             lines.append(f"  [INFO] Output: {self.output_rows} rows x {self.output_cols} columns")
             lines.append(f"  [INFO] Missing-value mode: {self.missing_mode}")
             lines.append(f"  [INFO] Skipped: {len(self.skipped_patients)} patients")
-            if self.missing_mode == 'impute':
+            if self.missing_mode in ('impute', 'auto'):
                 lines.append(f"  [INFO] With missing values (mean-scenario imputation by R): "
                              f"{len(self.imputed_patients)} patients")
         if self.skipped_patients:
@@ -528,12 +601,16 @@ class ValidationReport:
                 lines.append(f"  [IMPUTE] ID={pid}: {', '.join(fields)}")
             if len(self.imputed_patients) > 20:
                 lines.append(f"  ... and {len(self.imputed_patients) - 20} more")
-        if self.auto_fixes:
-            lines.append(f"\n--- AUTO-FIXES APPLIED ({len(self.auto_fixes)}) ---")
-            for fix in self.auto_fixes[:30]:
-                lines.append(f"  {fix}")
-            if len(self.auto_fixes) > 30:
-                lines.append(f"  ... and {len(self.auto_fixes) - 30} more")
+        if self.cell_audit:
+            lines.append(f"\n--- FIELD-LEVEL NORMALIZATION ({len(self.cell_audit)} cells) ---")
+            for (rule, status), n in sorted(self.audit_counts().items()):
+                lines.append(f"  {rule:<28} {status:<13} x{n}")
+            flagged = [e for e in self.cell_audit if e['Status'] in ('needs_review', 'unresolved')]
+            for e in flagged[:30]:
+                lines.append(f"  [{e['Status'].upper()}] Row {e['Row']}, {e['Column']}: "
+                             f"'{e['Original']}' -> '{e['Normalized']}' ({e['Rule']}, {e['Source']})")
+            if len(flagged) > 30:
+                lines.append(f"  ... and {len(flagged) - 30} more (see field audit file)")
         if self.errors:
             lines.append(f"\n--- ERRORS ({len(self.errors)}) ---")
             for error in self.errors[:20]:
@@ -551,6 +628,10 @@ class ValidationReport:
         elif len(self.errors) == 0:
             lines.append(f"\n>>> PASS: {self.output_rows} patients passed validation "
                          f"(after skipping {len(self.skipped_patients)} incomplete records).")
+        elif self.output_rows > 0:
+            lines.append(f"\n>>> PASS WITH ISSUES: {self.output_rows} patients passed; "
+                         f"{len(self.errors)} validation error(s) caused those patients to be excluded "
+                         f"(see SKIPPED PATIENTS).")
         else:
             lines.append(f"\n>>> FAIL: {len(self.errors)} validation errors found.")
         return '\n'.join(lines) + '\n'
@@ -736,50 +817,213 @@ def missing_groups(fields):
     return ';'.join(groups) if groups else 'NONE'
 
 
+# ---- Stage 1: 逐儲存格正規化 ------------------------------------------------
+
+def _fmt_number(x):
+    """數值轉字串 (去除多餘的尾數)。"""
+    return format(float(x), '.10g')
+
+
+def _cell(value, rule='', status='unchanged', confidence='', note=''):
+    return {'value': value, 'rule': rule, 'status': status,
+            'confidence': confidence, 'note': note}
+
+
+def _normalize_number(col, text):
+    """數值欄位: 回傳 _cell(...) 或 None (無法解析)。"""
+    m = re.fullmatch(r'\s*(-?\d+(?:[.,]\d+)?)\s*([^\d\s].*)?', text)
+    if not m:
+        return None
+    num_text, unit = m.group(1), (m.group(2) or '').strip().lower()
+    comma = ',' in num_text
+    try:
+        num = float(num_text.replace(',', '.'))
+    except ValueError:
+        return None
+
+    rule, status, conf, note = '', 'unchanged', '', ''
+    if unit:
+        if unit in NUMERIC_UNITS_IGNORED.get(col, set()):
+            rule, status, conf = 'strip_unit', 'auto_applied', 'high'
+        elif col == 'HB' and unit == 'g/l':
+            num /= 10
+            rule, status, conf = 'unit_g_per_l_to_g_per_dl', 'needs_review', 'medium'
+            note = 'HB must be g/dL; value divided by 10'
+        elif col == 'TP53maxvaf' and unit == '%':
+            num /= 100
+            rule, status, conf = 'percent_to_fraction', 'needs_review', 'medium'
+            note = 'TP53maxvaf must be a fraction in 0-1'
+        else:
+            return None
+    elif comma:
+        rule, status, conf = 'decimal_comma', 'needs_review', 'medium'
+
+    if col == 'TP53maxvaf' and not rule and 1 < num <= 100:
+        num /= 100
+        rule, status, conf = 'vaf_percent_assumed', 'needs_review', 'medium'
+        note = 'value >1 assumed to be a percent; converted to fraction'
+
+    if not rule:
+        return _cell(text)
+    return _cell(_fmt_number(num), rule, status, conf, note)
+
+
+def _normalize_cell(col, raw):
+    """
+    以關鍵字/格式規則正規化單一儲存格。
+
+    回傳 dict: value / rule / status / confidence / note
+      status: unchanged | auto_applied | needs_review | unresolved
+    非模型欄位 (kind=None) 原樣回傳。unresolved = 規則無法解析 (可交給 LLM)。
+    """
+    kind = _field_kind(col)
+    text = '' if raw is None else str(raw).strip()
+    if kind is None:
+        return _cell(text)
+
+    if text in NA_STRINGS or text == 'NA':
+        if text == 'NA':
+            return _cell('NA')
+        return _cell('NA', 'na_alias', 'auto_applied', 'high')
+
+    # ND = Not Detected (有檢測、未偵測到) — 依欄位型態處理
+    if text.lower() in ND_ALIASES:
+        if kind in ('binary', 'tp53mut'):
+            return _cell('0', 'nd_not_detected_to_0', 'auto_applied', 'high',
+                         'ND = tested, not detected -> 0')
+        return _cell('NA', 'nd_to_na', 'auto_applied', 'high',
+                     'ND has no numeric/category value -> missing')
+
+    low = re.sub(r'[\s_]+', ' ', text.lower()).strip()
+
+    if kind == 'binary':
+        if text in ('0', '1'):
+            return _cell(text)
+        try:
+            f = float(text)
+            if f in (0.0, 1.0):
+                return _cell(str(int(f)), 'numeric_binary', 'auto_applied', 'high')
+        except ValueError:
+            pass
+        for words, val, conf in ((BINARY_TRUE_HIGH, '1', 'high'), (BINARY_FALSE_HIGH, '0', 'high'),
+                                 (BINARY_TRUE_MEDIUM, '1', 'medium'),
+                                 (BINARY_FALSE_MEDIUM, '0', 'medium')):
+            if low in words:
+                return _cell(val, 'binary_keyword', 'auto_applied' if conf == 'high'
+                             else 'needs_review', conf)
+        return _cell(text, 'unparsed', 'unresolved')
+
+    if kind == 'cyto':
+        key = re.sub(r'[\s_\-]+', ' ', low).strip()
+        canonical = CYTO_LOOKUP.get(key)
+        if canonical is None:
+            return _cell(text, 'unparsed', 'unresolved')
+        if canonical == text:
+            return _cell(text)
+        return _cell(canonical, 'cyto_case_normalized', 'auto_applied', 'high')
+
+    if kind == 'tp53mut':
+        if text in ('0', '1', '2 or more'):
+            return _cell(text)
+        if text in TP53_MULTI_ALIASES:
+            return _cell('2 or more', 'tp53mut_multi_alias', 'auto_applied', 'high',
+                         "R package only accepts '2 or more' for >=2 TP53 mutations")
+        try:
+            f = float(text)
+            if f in (0.0, 1.0):
+                return _cell(str(int(f)), 'numeric_binary', 'auto_applied', 'high')
+            if f == 2.0:
+                return _cell('2 or more', 'tp53mut_multi_alias', 'auto_applied', 'high')
+        except ValueError:
+            pass
+        if low in BINARY_FALSE_HIGH:
+            return _cell('0', 'binary_keyword', 'auto_applied', 'high')
+        return _cell(text, 'unparsed', 'unresolved')
+
+    # number
+    parsed = _normalize_number(col, text)
+    if parsed is None:
+        return _cell(text, 'unparsed', 'unresolved')
+    return parsed
+
+
+def _llm_spec(col):
+    """LLM 查詢用的 (kind, 允許值)。"""
+    kind = _field_kind(col)
+    if kind == 'binary':
+        return 'binary', ['0', '1']
+    if kind == 'cyto':
+        return 'cyto', list(CYTO_CATEGORIES)
+    if kind == 'tp53mut':
+        return 'tp53mut', ['0', '1', '2 or more']
+    return 'number', []
+
+
+def _normalize_row(row_idx, row, report, llm_resolver=None):
+    """
+    正規化一列中的所有模型欄位 (就地修改 row)，並把每個「有變動或無法解析」的
+    儲存格寫入 report.cell_audit。規則無法解析者，若有 llm_resolver 則交給 LLM，
+    採用與否依其信心程度；一律標為 needs_review。
+    """
+    patient_id = row.get('ID', f'Row{row_idx}')
+    for col in list(row.keys()):
+        if _field_kind(col) is None:
+            continue
+        raw = row[col]
+        result = _normalize_cell(col, raw)
+
+        if result['status'] == 'unresolved' and llm_resolver is not None:
+            kind, allowed = _llm_spec(col)
+            llm = llm_resolver.resolve(col, str(raw).strip(), kind, allowed)
+            if llm.accepted:
+                value = llm.value
+                if value != 'NA' and kind == 'number':
+                    value = _fmt_number(value)
+                result = _cell(value, 'llm_interpretation', 'needs_review',
+                               f"{llm.confidence:.2f}", llm.reason)
+                result['source'] = 'llm'
+            else:
+                note = llm.error or 'LLM could not interpret the text'
+                result = _cell(result['value'], 'unparsed', 'unresolved', '', note)
+                result['source'] = 'llm_rejected'
+
+        row[col] = result['value']
+        if result['status'] != 'unchanged':
+            report.add_audit(row_idx, patient_id, col, str(raw).strip(), result['value'],
+                             result['rule'], result.get('source', 'rule'), result['status'],
+                             result['confidence'], result['note'])
+
+
 def _validate_row(row_idx, row, report, missing_mode=DEFAULT_MISSING_MODE):
     """
-    驗證單一資料列，回傳 True=有效 / False=跳過。
+    驗證單一資料列 (假設已經過 _normalize_row)，回傳 True=有效 / False=跳過。
 
     驗證步驟:
-      1. NA 標準化 (含 ND -> NA 轉換)
-      2. 必填欄位檢查 (HB, PLT, BM_BLAST)
-      3. 數值範圍檢查
-      4. 二元欄位 (0/1) 檢查
-      5. 分類欄位 (CYTO_IPSSR, TP53mut) 檢查
+      1. 缺失值處理 (skip 模式: 任何模型欄位缺失即跳過)
+      2. 數值範圍檢查
+      3. 二元欄位 (0/1) 檢查
+      4. 分類欄位 (CYTO_IPSSR, TP53mut) 檢查
     """
     patient_id = row.get('ID', f'Row{row_idx}')
     # 記錄進入本列前的錯誤數，讓有效性判斷只依「本列」是否新增錯誤，
     # 避免前面某列的錯誤導致其後所有正常病患被誤判為無效而遭丟棄。
     errors_before = len(report.errors)
 
-    # NA 標準化 (including ND -> NA for CYTO_IPSSR)
+    # 殘留的 NA 類字串一律標準化 (非模型欄位也一併處理，不記稽核)
     for col, value in row.items():
-        if isinstance(value, str):
-            if col == 'CYTO_IPSSR' and value.strip().upper() == 'ND':
-                row[col] = 'NA'
-                report.add_fix(row_idx, col, value, 'NA', 'Converted ND (not detected) to NA')
-            elif value in NA_STRINGS:
-                row[col] = 'NA'
-                report.add_fix(row_idx, col, value, 'NA', 'Converted NA-like value to standard NA')
+        if isinstance(value, str) and value in NA_STRINGS:
+            row[col] = 'NA'
 
-    # TP53mut 各種寫法統一 (R 套件只接受 '0' / '1' / '2 or more'，其餘會讓整批計算失敗)
-    tp53_raw = row.get('TP53mut')
-    if isinstance(tp53_raw, str) and tp53_raw.strip() in TP53_MULTI_ALIASES \
-            and tp53_raw.strip() != '2 or more':
-        row['TP53mut'] = '2 or more'
-        report.add_fix(row_idx, 'TP53mut', tp53_raw, '2 or more',
-                       "R package only accepts '2 or more' for >=2 TP53 mutations")
-
-    # 缺失值處理 (使用者選擇的模式)
-    missing = missing_model_fields(row)
+    # skip 模式: 任何模型輸入欄位缺失的病患一律跳過。
+    # impute / auto 模式保留 NA，交給 R 套件做 Best/Mean/Worst 情境分析
+    # (通過驗證後由 screen_input 記錄到 report.imputed_patients)。
     if missing_mode == 'skip':
+        missing = missing_model_fields(row)
         if missing:
             report.skip_patient(
-                patient_id,
-                f"Missing value(s) [skip mode]: {', '.join(missing)}")
+                patient_id, f"Missing value(s) [skip mode]: {', '.join(missing)}",
+                kind='missing', row=row_idx)
             return False
-    # impute 模式: 保留 NA，交給 R 套件做 Best/Mean/Worst 情境分析
-    # (通過驗證後由 run_screening 記錄到 report.imputed_patients)
 
     # 數值範圍檢查
     for col in ['HB', 'PLT', 'BM_BLAST', 'TP53maxvaf']:
@@ -808,7 +1052,7 @@ def _validate_row(row_idx, row, report, missing_mode=DEFAULT_MISSING_MODE):
     cyto = row.get('CYTO_IPSSR', 'NA')
     if isinstance(cyto, str):
         cyto = cyto.strip()
-    if cyto not in ('NA', 'Very Good', 'Good', 'Intermediate', 'Poor', 'Very Poor'):
+    if cyto not in ['NA'] + CYTO_CATEGORIES:
         report.add_error(row_idx, 'CYTO_IPSSR', f"Invalid category: {cyto}")
 
     tp53 = row.get('TP53mut', 'NA')
@@ -821,87 +1065,119 @@ def _validate_row(row_idx, row, report, missing_mode=DEFAULT_MISSING_MODE):
     return len(report.errors) == errors_before
 
 
-def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSING_MODE):
+def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=None):
     """
-    執行資料驗證（第一階段），回傳是否成功。
+    Stage 1 核心: 讀檔 -> 欄位對應/核型解析 -> 逐儲存格正規化 (含選用的 LLM) -> 驗證。
+
+    回傳 (rows, report)
+      rows:   通過驗證的病患，每列為 STANDARD_COLUMNS 42 欄 (缺失以 'NA' 表示)
+      report: ValidationReport (含逐儲存格稽核、排除清單、補值清單、LLM 結果)
+    """
+    if missing_mode not in MISSING_MODES:
+        raise ValueError(f"missing_mode must be one of {MISSING_MODES}, got {missing_mode!r}")
+
+    report = ValidationReport()
+    report.missing_mode = missing_mode
+
+    rows, fieldnames, converted = _try_convert_cohort(input_path, report)
+    if converted:
+        print("  [OK] Successfully converted to standard IPSSM format\n")
+
+    report.input_cols = len(fieldnames)
+    report.input_rows = len(rows)
+    rows = _convert_fjuh_format(rows, fieldnames, report)
+
+    valid_rows = []
+    for row_idx, row in enumerate(rows, start=2):
+        cleaned = {
+            (k.strip() if k else k): (v.strip() if isinstance(v, str) else v)
+            for k, v in row.items()
+        }
+        _normalize_row(row_idx, cleaned, report, llm_resolver)
+
+        errors_before = len(report.errors)
+        skipped_before = len(report.skipped_patients)
+        if _validate_row(row_idx, cleaned, report, missing_mode):
+            valid_rows.append(cleaned)
+            still_missing = missing_model_fields(cleaned)
+            if still_missing:
+                report.add_imputed(cleaned.get('ID', f'Row{row_idx}'), still_missing)
+        elif len(report.skipped_patients) == skipped_before:
+            # 有錯誤的列不進 R 計算，但明確記錄為 SKIP(而非靜默丟棄)，
+            # 且不影響其他正常病患。(已由 _validate_row 記錄 SKIP 者不重複記錄)
+            new_errors = report.errors[errors_before:]
+            reason = new_errors[0] if new_errors else "Validation error"
+            report.skip_patient(cleaned.get('ID', f'Row{row_idx}'), reason,
+                                kind='validation', row=row_idx)
+
+    final_rows = [{col: row.get(col, 'NA') for col in STANDARD_COLUMNS} for row in valid_rows]
+    report.output_rows = len(final_rows)
+    report.output_cols = len(STANDARD_COLUMNS)
+    if llm_resolver is not None:
+        report.llm_results = list(llm_resolver.log)
+    return final_rows, report
+
+
+def _write_audit_csv(path, cell_audit):
+    """寫出逐欄位正規化紀錄 (機器可讀 CSV)。"""
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=AUDIT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(cell_audit)
+
+
+def _write_standardized_csv(path, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=STANDARD_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_screening_log(log_path, report_text):
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 70 + "\n")
+        f.write("IPSSM Screener Validation Report\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 70 + "\n")
+        f.write(report_text)
+
+
+def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSING_MODE,
+                  llm_resolver=None, audit_path=None):
+    """
+    執行資料驗證（Stage 1），回傳是否成功。
 
     missing_mode:
       'skip'   - 任何模型輸入欄位缺失的病患一律跳過
       'impute' - 保留 NA，交給 R 套件做 Best/Mean/Worst 情境分析 (預設)
-
-    流程:
-      1. 嘗試隊列格式轉換 (_try_convert_cohort)
-      2. 修復欄名空格 (_convert_fjuh_format)
-      3. 逐列驗證 (_validate_row)
-      4. 輸出清理後 CSV 與驗證日誌
+      'auto'   - 此階段同 impute；範圍過大者由 Stage 2 試算後排除
+    audit_path: 若給定，另存逐欄位正規化紀錄 CSV。
     """
+    if missing_mode not in MISSING_MODES:
+        raise ValueError(f"missing_mode must be one of {MISSING_MODES}, got {missing_mode!r}")
+
     print(f"\n{'='*60}")
-    print(f"  [階段 1] 資料驗證 & 格式轉換")
+    print(f"  [階段 1] 資料正規化 & 驗證")
     print(f"{'='*60}")
     print(f"  輸入:  {input_path}")
     print(f"  輸出:  {output_path}")
-    print(f"  日誌:  {log_path}\n")
-
-    if missing_mode not in MISSING_MODES:
-        raise ValueError(f"missing_mode must be one of {MISSING_MODES}, got {missing_mode!r}")
+    print(f"  日誌:  {log_path}")
     print(f"  缺失值模式: {missing_mode}\n")
 
-    report = ValidationReport()
-    report.missing_mode = missing_mode
-    valid_rows = []
-
     try:
-        rows, fieldnames, converted = _try_convert_cohort(input_path, report)
-        if converted:
-            print(f"  [OK] Successfully converted to standard IPSSM format\n")
-
-        report.input_cols = len(fieldnames)
-        report.input_rows = len(rows)
-        rows = _convert_fjuh_format(rows, fieldnames, report)
-
-        for row_idx, row in enumerate(rows, start=2):
-            cleaned = {
-                (k.strip() if k else k): (v.strip() if isinstance(v, str) else v)
-                for k, v in row.items()
-            }
-            errors_before = len(report.errors)
-            skipped_before = len(report.skipped_patients)
-            if _validate_row(row_idx, cleaned, report, missing_mode):
-                valid_rows.append(cleaned)
-                still_missing = missing_model_fields(cleaned)
-                if still_missing:
-                    report.add_imputed(cleaned.get('ID', f'Row{row_idx}'), still_missing)
-            elif len(report.skipped_patients) == skipped_before:
-                # 有錯誤的列不進 R 計算，但明確記錄為 SKIP(而非靜默丟棄)，
-                # 且不影響其他正常病患。(已由 _validate_row 記錄 SKIP 者不重複記錄)
-                new_errors = report.errors[errors_before:]
-                reason = new_errors[0] if new_errors else "Validation error"
-                report.skip_patient(cleaned.get('ID', f'Row{row_idx}'), reason)
-
-        final_rows = []
-        for row in valid_rows:
-            final_row = {col: row.get(col, 'NA') for col in STANDARD_COLUMNS}
-            final_rows.append(final_row)
-        report.output_rows = len(final_rows)
-        report.output_cols = len(STANDARD_COLUMNS)
-
-        with open(output_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=STANDARD_COLUMNS)
-            writer.writeheader()
-            writer.writerows(final_rows)
+        rows, report = screen_input(input_path, missing_mode, llm_resolver)
+        _write_standardized_csv(output_path, rows)
+        if audit_path:
+            _write_audit_csv(audit_path, report.cell_audit)
 
         report_text = report.report()
         print(report_text)
-
-        with open(log_path, 'w', encoding='utf-8') as f:
-            f.write("=" * 70 + "\n")
-            f.write("IPSSM Screener Validation Report\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 70 + "\n")
-            f.write(report_text)
+        _write_screening_log(log_path, report_text)
 
         print(f"  [OK] Cleaned CSV: {output_path}")
         print(f"  [OK] 驗證日誌:    {log_path}")
+        if audit_path:
+            print(f"  [OK] 逐欄位紀錄:  {audit_path}")
         # 只要有任何有效輸出列即視為成功；有問題的列已被記錄為 SKIP，
         # 不再因單筆錯誤而讓整批作廢。
         return report.output_rows > 0
@@ -964,7 +1240,7 @@ def _read_validation_data(validation_path):
     return {}
 
 
-def _save_excel(r_results, output_path, validation_data=None):
+def _save_excel(r_results, output_path, validation_data=None, extra_sheets=None):
     """儲存結果到多工作表 Excel"""
     wb = Workbook()
     wb.remove(wb.active)
@@ -1042,6 +1318,18 @@ def _save_excel(r_results, output_path, validation_data=None):
         for letter, width in zip('ABCDEFG', [12, 14, 14, 16, 10, 12, 30]):
             ws_a.column_dimensions[letter].width = width
 
+    # --- 額外工作表 (例如 auto 模式排除的 UNCERTAIN 清單) ---
+    for name, headers, rows in (extra_sheets or []):
+        ws_x = wb.create_sheet(name)
+        ws_x.append(list(headers))
+        for cell in ws_x[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        for r in rows:
+            ws_x.append(list(r))
+        for col in ws_x.columns:
+            ws_x.column_dimensions[col[0].column_letter].width = 16
+
     wb.save(output_path)
 
 
@@ -1065,18 +1353,59 @@ def _annotate_missing_info(r_results, cleaned_csv_path):
             fields = missing_model_fields(input_rows[i])
             result['Missing_Fields'] = ', '.join(fields) if fields else 'NONE'
             result['Missing_Groups'] = missing_groups(fields)
+            result['Key_Missing_Fields'] = (
+                ', '.join(f for f in fields if f in STRONG_MISSING_FIELDS) or 'NONE')
             result['Used_Scenario_Analysis'] = 'YES' if fields else 'NO'
         else:
             result['Missing_Fields'] = result['Missing_Groups'] = 'UNKNOWN'
+            result['Key_Missing_Fields'] = 'UNKNOWN'
             result['Used_Scenario_Analysis'] = 'UNKNOWN'
         result['Reported_Score'] = result.get('IPSSMscore_mean', 'NA')
         result['Reported_Cat'] = result.get('IPSSMcat_mean', 'NA')
 
 
-def run_translation(input_csv, rscript_path=None, validation_path=None):
-    """執行 R 計算 + 結果整合（第二階段），回傳是否成功"""
+def _run_r_scoring(input_csv, rscript, output_csv, error_dir, quiet=False):
+    """
+    以官方 ipssm 套件計算 (Best/Mean/Worst + Range + Confidence)。
+    成功回傳 R 輸出的 list[dict]，失敗回傳 None (並在 error_dir 寫 r_error.log)。
+    """
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.R', delete=False) as f:
+        f.write(R_SCRIPT_TEMPLATE)
+        r_script_file = f.name
+
+    try:
+        cmd = [rscript, r_script_file, str(input_csv), str(output_csv)]
+        r_env = os.environ.copy()
+        # 只有在使用者沒設定 R_LIBS_USER、且 ~/R/library 存在時才補上，
+        # 避免覆寫 RStudio / 系統預設的 library 路徑。
+        user_lib = os.path.expanduser("~/R/library")
+        if "R_LIBS_USER" not in r_env and os.path.isdir(user_lib):
+            r_env["R_LIBS_USER"] = user_lib
+        result = subprocess.run(cmd, capture_output=True, text=True, env=r_env)
+
+        if result.stdout and not quiet:
+            print(result.stdout)
+        if result.returncode != 0 or not Path(output_csv).exists():
+            print("  [ERROR] ERROR: R 執行失敗" if result.returncode != 0
+                  else "  [ERROR] ERROR: R 輸出檔案未產生")
+            if result.stderr:
+                print("  [STDERR]:", result.stderr)
+            with open(Path(error_dir) / "r_error.log", "w", encoding="utf-8") as f:
+                f.write("[STDOUT]\n" + (result.stdout or "") + "\n\n[STDERR]\n"
+                        + (result.stderr or "No stderr output recorded."))
+            return None
+        return _read_r_output(output_csv)
+    finally:
+        Path(r_script_file).unlink(missing_ok=True)
+
+
+def run_translation(input_csv, rscript_path=None, validation_path=None, extra_sheets=None):
+    """
+    Stage 4 — 正式計算: 對「已核對的標準欄位 CSV」執行 R 計算 + 結果整合，回傳是否成功。
+    extra_sheets: 額外要寫入結果活頁簿的 [(sheet 名稱, 欄位標題, 資料列)]。
+    """
     print(f"\n{'='*60}")
-    print(f"  [階段 2] R 風險計算 & 信心等級標記")
+    print(f"  [階段 4] 正式計算風險 & 信心等級標記")
     print(f"{'='*60}")
 
     input_path = Path(input_csv)
@@ -1100,92 +1429,420 @@ def run_translation(input_csv, rscript_path=None, validation_path=None):
     if validation_path:
         print(f"  驗證檔:  {validation_path}")
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.R', delete=False) as f:
-        f.write(R_SCRIPT_TEMPLATE)
-        r_script_file = f.name
+    print("\n  執行 R IPSSMwrapper...")
+    r_results = _run_r_scoring(input_path, rscript, r_output_csv, output_dir)
+    if r_results is None:
+        return False
 
+    print("  處理結果中...")
+    _annotate_missing_info(r_results, input_path)
+
+    validation_data = {}
+    if validation_path:
+        validation_data = _read_validation_data(validation_path)
+
+    confident = sum(1 for r in r_results if r.get('Confidence_Level') == 'CONFIDENT')
+    uncertain = sum(1 for r in r_results if r.get('Confidence_Level') == 'UNCERTAIN')
+    with_missing = sum(1 for r in r_results if r.get('Used_Scenario_Analysis') == 'YES')
+
+    print(f"\n  === 信心等級統計 ===")
+    print(f"  CONFIDENT (range <= 1): {confident}")
+    print(f"  UNCERTAIN (range > 1):  {uncertain}")
+    print(f"  含缺失值 (以 Mean 情境補值): {with_missing}")
+    print(f"  總計: {len(r_results)}\n")
+
+    _save_excel(r_results, excel_output, validation_data, extra_sheets)
+
+    print(f"  [OK] 結果已儲存: {excel_output}")
+    print(f"    Sheet 'Summary':       ID + 分數/分類 + Confidence_Level + 缺失欄位")
+    print(f"    Sheet 'R_Full_Output':  完整 R 計算數據")
+    if validation_data:
+        print(f"    Sheet 'Analysis':      與驗證數據比對")
+    for name, _, rows in (extra_sheets or []):
+        print(f"    Sheet '{name}': {len(rows)} 筆")
+    return True
+
+
+# ============================================================================
+#  Stage 2 試算 / Stage 3 核對用資料 (Review)
+# ============================================================================
+
+MISSING_CHECK_COLUMNS = [
+    'ID', 'Missing_Fields', 'Missing_Groups', 'Key_Missing_Fields',
+    'IPSSMscore_best', 'IPSSMscore_mean', 'IPSSMscore_worst',
+    'IPSSMcat_best', 'IPSSMcat_mean', 'IPSSMcat_worst',
+    'Range_Score', 'Confidence_Level', 'Decision',
+]
+
+
+def run_trial_calculation(rows, rscript, quiet=True):
+    """
+    Stage 2 — 試算缺失值造成的風險範圍: 對正規化後的列呼叫 R，取得
+    Best/Mean/Worst 與 Range。使用暫存目錄，不會在使用者資料夾留下檔案。
+    成功回傳與 rows 同序的 list[dict]，失敗回傳 None。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_csv = Path(tmp) / 'trial_input.csv'
+        _write_standardized_csv(tmp_csv, rows)
+        results = _run_r_scoring(tmp_csv, rscript, Path(tmp) / 'trial_output.csv',
+                                 error_dir=tmp, quiet=quiet)
+        if results is None:
+            return None
+        _annotate_missing_info(results, tmp_csv)
+        return results
+
+
+def _range_value(result):
     try:
-        print("\n  執行 R IPSSMwrapper...")
-        cmd = [rscript, r_script_file, str(input_path), str(r_output_csv)]
+        return float(result.get('Range_Score'))
+    except (TypeError, ValueError):
+        return float('inf')
 
-        r_env = os.environ.copy()
-        # 只有在使用者沒設定 R_LIBS_USER、且 ~/R/library 存在時才補上，
-        # 避免覆寫 RStudio / 系統預設的 library 路徑。
-        user_lib = os.path.expanduser("~/R/library")
-        if "R_LIBS_USER" not in r_env and os.path.isdir(user_lib):
-            r_env["R_LIBS_USER"] = user_lib
-        result = subprocess.run(cmd, capture_output=True, text=True, env=r_env)
 
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print("  [STDERR]:", result.stderr)
+def build_missing_check(rows, trial):
+    """每位通過驗證的病患一列: 缺失欄位 + 試算結果 (若有)。Decision 由呼叫端填入。"""
+    check = []
+    for i, row in enumerate(rows):
+        fields = missing_model_fields(row)
+        entry = {c: '' for c in MISSING_CHECK_COLUMNS}
+        entry.update({
+            'ID': row.get('ID', ''),
+            'Missing_Fields': ', '.join(fields) if fields else 'NONE',
+            'Missing_Groups': missing_groups(fields),
+            'Key_Missing_Fields': ', '.join(f for f in fields if f in STRONG_MISSING_FIELDS) or 'NONE',
+            'Confidence_Level': 'NOT_COMPUTED',
+        })
+        if trial is not None:
+            for c in MISSING_CHECK_COLUMNS[4:12]:
+                entry[c] = trial[i].get(c, '')
+        check.append(entry)
+    return check
 
-        if result.returncode != 0:
-            print("  [ERROR] ERROR: R 執行失敗")
-            with open(output_dir / "r_error.log", "w", encoding="utf-8") as f:
-                f.write(result.stderr or "No stderr output recorded.")
-            return False
 
-        if not r_output_csv.exists():
-            print("  [ERROR] ERROR: R 輸出檔案未產生")
-            with open(output_dir / "r_error.log", "w", encoding="utf-8") as f:
-                f.write("R completed but output file was not generated.\n\n[STDOUT]\n"
-                        + (result.stdout or "") + "\n\n[STDERR]\n" + (result.stderr or ""))
-            return False
+def _style_sheet(ws, header_fill, header_font, widths=None):
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+    ws.freeze_panes = 'A2'
+    for idx, col in enumerate(ws.columns):
+        letter = col[0].column_letter
+        width = (widths[idx] if widths and idx < len(widths) else 14)
+        ws.column_dimensions[letter].width = width
 
-        print("  處理結果中...")
-        r_results = _read_r_output(r_output_csv)
-        _annotate_missing_info(r_results, input_path)
 
-        validation_data = {}
-        if validation_path:
-            validation_data = _read_validation_data(validation_path)
+def _save_review_workbook(path, report, included_rows, missing_check, mode, max_range,
+                          trial_available, llm_info):
+    """Stage 3 — 核對用活頁簿: 摘要 / 標準欄位資料 / 逐欄位紀錄 / 缺失檢核 / UNCERTAIN / 排除 / LLM。"""
+    wb = Workbook()
+    wb.remove(wb.active)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    review_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    bad_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
-        confident = sum(1 for r in r_results if r.get('Confidence_Level') == 'CONFIDENT')
-        uncertain = sum(1 for r in r_results if r.get('Confidence_Level') == 'UNCERTAIN')
-        with_missing = sum(1 for r in r_results if r.get('Used_Scenario_Analysis') == 'YES')
+    n_review = sum(1 for e in report.cell_audit if e['Status'] == 'needs_review')
+    n_unres = sum(1 for e in report.cell_audit if e['Status'] == 'unresolved')
+    kinds = {}
+    for ex in report.excluded:
+        kinds[ex['Source']] = kinds.get(ex['Source'], 0) + 1
+    n_uncertain = sum(1 for m in missing_check if m['Confidence_Level'] == 'UNCERTAIN')
 
-        print(f"\n  === 信心等級統計 ===")
-        print(f"  CONFIDENT (range <= 1): {confident}")
-        print(f"  UNCERTAIN (range > 1):  {uncertain}")
-        print(f"  含缺失值 (以 Mean 情境補值): {with_missing}")
-        print(f"  總計: {len(r_results)}\n")
+    # --- Summary ---
+    ws = wb.create_sheet("Summary")
+    ws.append(['項目', '內容'])
+    summary = [
+        ('輸入列數', report.input_rows),
+        ('缺失值模式', f"{mode}" + (f" (範圍門檻 Worst-Best <= {max_range})" if mode == 'auto' else '')),
+        ('逐欄位正規化紀錄', f"{len(report.cell_audit)} 筆 (需人工確認 {n_review}、無法解析 {n_unres})"),
+        ('通過驗證的病患', len(missing_check)),
+        ('排除 — 資料錯誤 (validation)', kinds.get('validation', 0)),
+        ('排除 — 缺失值 (skip 模式)', kinds.get('missing', 0)),
+        ('排除 — 範圍過大 UNCERTAIN (auto 模式)', kinds.get('uncertain', 0)),
+        ('試算結果中 UNCERTAIN (Range > 1)', n_uncertain if trial_available else '未試算 (找不到 R)'),
+        ('進入正式計算的病患 (Standardized sheet)', len(included_rows)),
+        ('LLM 輔助', llm_info or '未啟用'),
+        ('下一步', '核對 Standardized / Field_Audit / Uncertain 後，確認無誤再執行正式計算 (--calc-only 或 --confirm)'),
+    ]
+    for item in summary:
+        ws.append(list(item))
+    _style_sheet(ws, header_fill, header_font, [44, 90])
 
-        _save_excel(r_results, excel_output, validation_data)
+    # --- Standardized ---
+    ws = wb.create_sheet("Standardized")
+    ws.append(STANDARD_COLUMNS)
+    for row in included_rows:
+        ws.append([row.get(c, 'NA') for c in STANDARD_COLUMNS])
+    _style_sheet(ws, header_fill, header_font, [12] + [11] * (len(STANDARD_COLUMNS) - 1))
 
-        print(f"  [OK] 結果已儲存: {excel_output}")
-        print(f"    Sheet 'Summary':       ID + 分數/分類 + Confidence_Level + 缺失欄位")
-        print(f"    Sheet 'R_Full_Output':  完整 R 計算數據")
-        if validation_data:
-            print(f"    Sheet 'Analysis':      與驗證數據比對")
-        return True
+    # --- Field_Audit ---
+    ws = wb.create_sheet("Field_Audit")
+    ws.append(AUDIT_COLUMNS)
+    for e in report.cell_audit:
+        ws.append([e[c] for c in AUDIT_COLUMNS])
+        fill = review_fill if e['Status'] == 'needs_review' else (
+            bad_fill if e['Status'] == 'unresolved' else None)
+        if fill:
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
+    _style_sheet(ws, header_fill, header_font, [7, 12, 14, 18, 18, 28, 12, 14, 11, 50])
 
-    finally:
-        Path(r_script_file).unlink(missing_ok=True)
+    # --- Column_Summary ---
+    ws = wb.create_sheet("Column_Summary")
+    ws.append(['Column', 'Patients', 'Missing(NA)', 'Cells changed', 'Needs review', 'Unresolved'])
+    for col in STANDARD_COLUMNS:
+        if col == 'ID':
+            continue
+        changed = [e for e in report.cell_audit if e['Column'] == col]
+        ws.append([col, len(included_rows),
+                   sum(1 for r in included_rows if _is_na_value(r.get(col))),
+                   len(changed),
+                   sum(1 for e in changed if e['Status'] == 'needs_review'),
+                   sum(1 for e in changed if e['Status'] == 'unresolved')])
+    _style_sheet(ws, header_fill, header_font, [14, 10, 13, 15, 14, 12])
+
+    # --- Missing_Check ---
+    ws = wb.create_sheet("Missing_Check")
+    ws.append(MISSING_CHECK_COLUMNS)
+    for m in missing_check:
+        ws.append([m[c] for c in MISSING_CHECK_COLUMNS])
+        if m['Confidence_Level'] == 'UNCERTAIN':
+            for cell in ws[ws.max_row]:
+                cell.fill = bad_fill
+    _style_sheet(ws, header_fill, header_font, [12, 38, 24, 22] + [12] * 6 + [11, 16, 20])
+
+    # --- Uncertain ---
+    ws = wb.create_sheet("Uncertain")
+    ws.append(MISSING_CHECK_COLUMNS)
+    for m in missing_check:
+        if m['Confidence_Level'] == 'UNCERTAIN':
+            ws.append([m[c] for c in MISSING_CHECK_COLUMNS])
+    _style_sheet(ws, header_fill, header_font, [12, 38, 24, 22] + [12] * 6 + [11, 16, 20])
+
+    # --- Excluded ---
+    ws = wb.create_sheet("Excluded")
+    ws.append(['ID', 'Row', 'Source', 'Reason'])
+    for ex in report.excluded:
+        ws.append([ex['ID'], ex['Row'], ex['Source'], ex['Reason']])
+    _style_sheet(ws, header_fill, header_font, [14, 7, 13, 100])
+
+    # --- LLM_Review ---
+    if report.llm_results:
+        ws = wb.create_sheet("LLM_Review")
+        ws.append(['Column', 'Original text', 'LLM value', 'Confidence', 'Accepted',
+                   'Reason / Error', 'Cells affected'])
+        for r in report.llm_results:
+            affected = sum(1 for e in report.cell_audit
+                           if e['Column'] == r.column and e['Original'] == r.raw_value)
+            ws.append([r.column, r.raw_value, r.value, round(r.confidence, 2),
+                       'YES' if r.accepted else 'NO', r.error or r.reason, affected])
+            if not r.accepted:
+                for cell in ws[ws.max_row]:
+                    cell.fill = bad_fill
+        _style_sheet(ws, header_fill, header_font, [14, 24, 14, 11, 10, 60, 14])
+
+    wb.save(path)
+
+
+def _build_llm_info(llm_resolver):
+    if llm_resolver is None:
+        return None
+    cfg = llm_resolver.config
+    where = '遠端' if llm_resolver.is_remote else '本地'
+    accepted = sum(1 for r in llm_resolver.log if r.accepted)
+    return (f"{cfg.provider} / {cfg.resolved_model()} @ {cfg.resolved_endpoint()} ({where}); "
+            f"查詢 {len(llm_resolver.log)} 個不同文字，採用 {accepted} 個 (信心門檻 {cfg.min_confidence})")
+
+
+def run_review_pipeline(input_path, missing_mode=DEFAULT_MISSING_MODE, max_range=DEFAULT_MAX_RANGE,
+                        rscript_path=None, llm_resolver=None):
+    """
+    Stage 1~3: 正規化 (逐欄位紀錄, 選用 LLM) -> 試算缺失值風險 (UNCERTAIN 清單) ->
+    產生標準欄位資料與核對用活頁簿。回傳結果 dict (含各輸出路徑)，失敗回傳 None。
+    正式計算 (Stage 4) 由使用者核對後另行執行 (run_translation)。
+    """
+    if missing_mode not in MISSING_MODES:
+        raise ValueError(f"missing_mode must be one of {MISSING_MODES}, got {missing_mode!r}")
+    input_path = Path(input_path)
+    parent, stem = input_path.parent, input_path.stem
+    paths = {
+        'standardized': parent / f"{stem}_standardized.csv",
+        'audit': parent / f"{stem}_field_audit.csv",
+        'review': parent / f"{stem}_review.xlsx",
+        'log': parent / f"{stem}_screening_log.txt",
+    }
+
+    # ---- Stage 1 ----
+    print(f"\n{'='*60}")
+    print(f"  [階段 1] 資料正規化 & 逐欄位紀錄")
+    print(f"{'='*60}")
+    print(f"  輸入: {input_path}")
+    print(f"  缺失值模式: {missing_mode}"
+          + (f" (Worst-Best 範圍門檻 {max_range})" if missing_mode == 'auto' else ""))
+    if llm_resolver is not None:
+        print(f"  LLM 輔助: {llm_resolver.config.provider} @ {llm_resolver.config.resolved_endpoint()} "
+              f"({'遠端' if llm_resolver.is_remote else '本地'})")
+    try:
+        rows, report = screen_input(input_path, missing_mode, llm_resolver)
+    except Exception as e:
+        print(f"  [ERROR] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    if not rows:
+        report_text = report.report()
+        print(report_text)
+        _write_screening_log(paths['log'], report_text)
+        _write_audit_csv(paths['audit'], report.cell_audit)
+        print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
+        return None
+
+    # ---- Stage 2 ----
+    print(f"\n{'='*60}")
+    print(f"  [階段 2] 試算缺失值造成的風險範圍")
+    print(f"{'='*60}")
+    rscript = rscript_path or _find_rscript()
+    trial = None
+    if rscript:
+        trial = run_trial_calculation(rows, rscript)
+    else:
+        print("  [WARN] 找不到 Rscript，無法試算缺失值風險範圍。")
+    if trial is None and missing_mode == 'auto':
+        print("  [ERROR] auto 模式需要 R 試算才能判斷哪些病患範圍過大，無法繼續。")
+        return None
+
+    included_rows = rows
+    if missing_mode == 'auto':
+        keep = []
+        for i, (row, res) in enumerate(zip(rows, trial)):
+            rng = _range_value(res)
+            if rng <= max_range:
+                keep.append(i)
+            else:
+                fields = missing_model_fields(row)
+                key = [f for f in fields if f in STRONG_MISSING_FIELDS]
+                report.skip_patient(
+                    row.get('ID', ''),
+                    f"UNCERTAIN [auto mode]: Worst-Best range {rng:.2f} > {max_range}; "
+                    f"missing: {', '.join(fields) or 'NONE'}"
+                    + (f"; key fields: {', '.join(key)}" if key else ''),
+                    kind='uncertain')
+        included_rows = [rows[i] for i in keep]
+        report.output_rows = len(included_rows)
+
+    missing_check = build_missing_check(rows, trial)
+    included_ids = {id(r) for r in included_rows}
+    for entry, row in zip(missing_check, rows):
+        entry['Decision'] = 'INCLUDE' if id(row) in included_ids else 'EXCLUDE_UNCERTAIN'
+
+    if trial is not None:
+        n_unc = sum(1 for m in missing_check if m['Confidence_Level'] == 'UNCERTAIN')
+        n_missing = sum(1 for m in missing_check if m['Missing_Fields'] != 'NONE')
+        print(f"  含缺失欄位的病患: {n_missing} / {len(rows)}")
+        print(f"  試算 UNCERTAIN (Range > 1): {n_unc}")
+        if missing_mode == 'auto':
+            print(f"  auto 模式排除 (Range > {max_range}): {len(rows) - len(included_rows)}，"
+                  f"進入正式計算: {len(included_rows)}")
+
+    # ---- Stage 3 ----
+    print(f"\n{'='*60}")
+    print(f"  [階段 3] 產生標準欄位資料與核對檔")
+    print(f"{'='*60}")
+    report_text = report.report()
+    print(report_text)
+    _write_standardized_csv(paths['standardized'], included_rows)
+    _write_audit_csv(paths['audit'], report.cell_audit)
+    _write_screening_log(paths['log'], report_text)
+    _save_review_workbook(paths['review'], report, included_rows, missing_check,
+                          missing_mode, max_range, trial is not None,
+                          _build_llm_info(llm_resolver))
+    print(f"  [OK] 標準欄位資料: {paths['standardized']}")
+    print(f"  [OK] 逐欄位紀錄:   {paths['audit']}")
+    print(f"  [OK] 核對活頁簿:   {paths['review']}")
+    print(f"  [OK] 驗證日誌:     {paths['log']}")
+
+    uncertain_sheet = None
+    if missing_mode == 'auto':
+        excluded = [m for m in missing_check if m['Decision'] != 'INCLUDE']
+        if excluded:
+            uncertain_sheet = ('Uncertain_Excluded', MISSING_CHECK_COLUMNS,
+                               [[m[c] for c in MISSING_CHECK_COLUMNS] for m in excluded])
+    return {'paths': paths, 'report': report, 'rows': included_rows,
+            'missing_check': missing_check, 'uncertain_sheet': uncertain_sheet}
 
 
 # ============================================================================
 #  主程式入口
 # ============================================================================
 
+def _build_llm_resolver(args):
+    """依 CLI 參數建立 LLMResolver；未啟用回傳 None，設定錯誤時印出訊息並結束。"""
+    if not args.llm:
+        return None
+    from ipssm_llm import LLMConfig, LLMResolver, DEFAULT_KEY_ENV
+    key_env = args.llm_api_key_env or DEFAULT_KEY_ENV.get(args.llm_provider, '')
+    config = LLMConfig(
+        provider=args.llm_provider,
+        endpoint=args.llm_endpoint or '',
+        model=args.llm_model or '',
+        api_key=os.environ.get(key_env, '') if key_env else '',
+        min_confidence=args.llm_min_confidence,
+        allow_remote=args.llm_allow_remote,
+    )
+    try:
+        return LLMResolver(config)
+    except ValueError as e:
+        print(f"ERROR (LLM 設定): {e}")
+        sys.exit(2)
+
+
+def _add_llm_arguments(parser):
+    g = parser.add_argument_group(
+        'LLM 輔助檢核 (選用)',
+        '只處理關鍵字規則無法解析的儲存格；僅送出「欄位名稱 + 單一儲存格原文」，不含 ID 或其他欄位。'
+        '採用與否依信心程度，且一律標為「需人工確認」。')
+    g.add_argument('--llm', action='store_true', help='啟用 LLM 輔助檢核')
+    g.add_argument('--llm-provider', choices=('openai', 'anthropic'), default='openai',
+                   help='openai = OpenAI 相容 API (本地 Ollama/LM Studio/vLLM 或雲端皆可); '
+                        'anthropic = Anthropic Messages API (預設 openai)')
+    g.add_argument('--llm-endpoint', help='端點 base URL，例如 http://localhost:11434/v1 '
+                                          '(anthropic 預設 https://api.anthropic.com)')
+    g.add_argument('--llm-model', help='模型名稱 (openai 必填；anthropic 預設 claude-haiku-5-5)')
+    g.add_argument('--llm-api-key-env',
+                   help='存放 API key 的環境變數名稱 (預設 OPENAI_API_KEY / ANTHROPIC_API_KEY；'
+                        '本地端點可不需要)。請勿把 key 直接寫在指令列。')
+    g.add_argument('--llm-min-confidence', type=float, default=0.8,
+                   help='採用 LLM 結果的最低信心 (0~1，預設 0.8)')
+    g.add_argument('--llm-allow-remote', action='store_true',
+                   help='允許使用非本地端點 (資料會傳出本機；需確認已去識別化且符合使用條款)')
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='IPSSM Pipeline - 一鍵完成資料驗證 + R 風險計算',
-        epilog='支援 CSV 和 Excel 輸入，自動修復異常空格格式。'
+        description='IPSSM Pipeline — 正規化 -> 試算缺失值 -> 核對 -> 正式計算風險',
+        epilog='預設只做階段 1~3 並停下來讓你核對標準欄位資料；核對後加上 --confirm '
+               '(或另外執行 --calc-only) 才進行正式計算。',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('input_file', help='輸入檔案（CSV 或 Excel）')
+    parser.add_argument('input_file', help='輸入檔案（CSV 或 Excel；--calc-only 時為標準欄位 CSV）')
     parser.add_argument('-v', '--validation', help='手動驗證結果 Excel 檔案（比對用）')
     parser.add_argument('--rscript', help='Rscript 執行路徑')
     parser.add_argument('--missing', choices=MISSING_MODES, default=DEFAULT_MISSING_MODE,
                         help="缺失值處理: skip = 任何模型欄位缺失的病患一律跳過; "
-                             "impute = 保留 NA，由 R 套件以 Best/Mean/Worst 情境分析補值 "
-                             f"(預設 {DEFAULT_MISSING_MODE})")
-    parser.add_argument('--screen-only', action='store_true', help='僅執行資料驗證，不執行 R 計算')
-    parser.add_argument('--translate-only', action='store_true', help='僅執行 R 計算（輸入須為已清理的 CSV）')
+                             "impute = 保留 NA，由 R 套件以 Best/Mean/Worst 情境分析補平均值; "
+                             "auto = 先試算，缺失造成的範圍 (Worst-Best) 超過 --max-range 者排除並列入 "
+                             f"UNCERTAIN 清單，其餘補平均值計算 (預設 {DEFAULT_MISSING_MODE})")
+    parser.add_argument('--max-range', type=float, default=DEFAULT_MAX_RANGE,
+                        help=f'auto 模式的範圍門檻 (Worst-Best 超過此值視為 UNCERTAIN，預設 {DEFAULT_MAX_RANGE})')
+    parser.add_argument('--confirm', action='store_true',
+                        help='階段 1~3 完成後，不再停下來核對，直接以標準欄位資料進行正式計算 (階段 4)')
+    parser.add_argument('--calc-only', '--translate-only', dest='calc_only', action='store_true',
+                        help='只執行階段 4 正式計算（輸入須為已核對的標準欄位 CSV，即 *_standardized.csv）')
+    parser.add_argument('--screen-only', action='store_true',
+                        help='僅執行階段 1 (正規化 + 驗證)，不試算、不產生核對活頁簿')
     parser.add_argument('--inspect', action='store_true',
-                         help='唯讀掃描來源檔案標題並顯示欄位對應預覽，不執行驗證/計算、不寫任何檔案。'
-                              '適合用於不確定欄名是否能自動對應的「不乾淨」來源檔案。')
+                        help='唯讀掃描來源檔案標題並顯示欄位對應預覽，不執行驗證/計算、不寫任何檔案。'
+                             '適合用於不確定欄名是否能自動對應的「不乾淨」來源檔案。')
+    _add_llm_arguments(parser)
 
     args = parser.parse_args()
     input_path = Path(args.input_file)
@@ -1193,6 +1850,9 @@ def main():
     if not input_path.exists():
         print(f"ERROR: 輸入檔案不存在: {input_path}")
         sys.exit(1)
+    if args.max_range < 0:
+        print("ERROR: --max-range 不可為負數")
+        sys.exit(2)
 
     if args.inspect:
         print_inspect_report(inspect_columns(str(input_path)))
@@ -1205,28 +1865,48 @@ def main():
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*60}")
 
-    if args.translate_only:
+    # ---- 只做階段 4 ----
+    if args.calc_only:
         success = run_translation(str(input_path), args.rscript, validation_path)
         print(f"\n{'='*60}")
         print(f"  完成！{'[OK] 成功' if success else '[ERROR] 失敗'}")
         print(f"{'='*60}")
         sys.exit(0 if success else 1)
 
-    cleaned_csv = input_path.parent / f"{input_path.stem}_cleaned.csv"
-    log_path = input_path.parent / f"{input_path.stem}_screening_log.txt"
-    screen_ok = run_screening(input_path, cleaned_csv, log_path, missing_mode=args.missing)
+    llm_resolver = _build_llm_resolver(args)
 
-    if not screen_ok:
-        print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
-        sys.exit(1)
-
+    # ---- 只做階段 1 ----
     if args.screen_only:
-        print(f"\n{'='*60}")
-        print(f"  完成！（僅驗證模式）")
-        print(f"{'='*60}")
+        stem = input_path.parent / input_path.stem
+        screen_ok = run_screening(input_path, f"{stem}_standardized.csv",
+                                  f"{stem}_screening_log.txt", missing_mode=args.missing,
+                                  llm_resolver=llm_resolver, audit_path=f"{stem}_field_audit.csv")
+        if not screen_ok:
+            print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
+            sys.exit(1)
+        print(f"\n{'='*60}\n  完成！（僅階段 1）\n{'='*60}")
         sys.exit(0)
 
-    translate_ok = run_translation(str(cleaned_csv), args.rscript, validation_path)
+    # ---- 階段 1~3 ----
+    outcome = run_review_pipeline(input_path, args.missing, args.max_range, args.rscript, llm_resolver)
+    if outcome is None:
+        sys.exit(1)
+    std_csv = outcome['paths']['standardized']
+
+    if not args.confirm:
+        print(f"\n{'='*60}")
+        print(f"  階段 1~3 完成，請先核對再進行正式計算")
+        print(f"{'='*60}")
+        print(f"  1. 核對 {outcome['paths']['review']} (Standardized / Field_Audit / Uncertain / Excluded)")
+        print(f"  2. 如需修正，直接編輯 {std_csv}")
+        print(f"  3. 確認無誤後執行正式計算:")
+        print(f"       python3 ipssm_pipeline.py {std_csv} --calc-only")
+        print(f"     (或重新執行本指令並加上 --confirm)")
+        sys.exit(0)
+
+    # ---- 階段 4 (使用者以 --confirm 表示免核對) ----
+    extra = [outcome['uncertain_sheet']] if outcome['uncertain_sheet'] else None
+    translate_ok = run_translation(str(std_csv), args.rscript, validation_path, extra)
 
     print(f"\n{'='*60}")
     print(f"  Pipeline 完成！{'[OK] 全部成功' if translate_ok else '[ERROR] R 計算失敗'}")

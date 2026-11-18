@@ -3,6 +3,9 @@ backup/
 
 # Pipeline output (intermediate/results)
 *_cleaned.csv
+*_standardized.csv
+*_field_audit.csv
+*_review.xlsx
 *_r_output.csv
 *_results.xlsx
 *_screening_log.txt

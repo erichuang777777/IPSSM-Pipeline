@@ -3,7 +3,8 @@
 # regardless of the current working directory.
 #
 # Usage: run_ipssm.sh <input.csv|xlsx> [pipeline flags...]
-#   e.g. run_ipssm.sh cohort.xlsx
+#   e.g. run_ipssm.sh cohort.xlsx --missing auto              # stages 1-3, stop for review
+#        run_ipssm.sh cohort_standardized.csv --calc-only     # stage 4 after confirmation
 #        run_ipssm.sh cohort.csv --screen-only
 set -euo pipefail
 
@@ -17,7 +18,7 @@ if [[ ! -f "${repo_root}/ipssm_pipeline.py" ]]; then
 fi
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: run_ipssm.sh <input.csv|xlsx> [--screen-only|--translate-only|-v file|--rscript path]" >&2
+  echo "Usage: run_ipssm.sh <input.csv|xlsx> [--missing skip|impute|auto] [--confirm|--calc-only|--screen-only|-v file|--rscript path]" >&2
   exit 2
 fi
 

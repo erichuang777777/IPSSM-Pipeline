@@ -4,22 +4,23 @@
 
 ## 快速開始
 
+流程分四個階段，**預設在階段 3 停下來讓你核對標準欄位資料**，確認後才正式計算：
+
 ```bash
-# 一鍵全流程（驗證 → R 計算 → Excel 結果）
-python ipssm_pipeline.py data.xlsx
+# 階段 1~3：正規化(含逐欄位紀錄) → 試算缺失值風險 → 產生標準欄位資料與核對檔
+python ipssm_pipeline.py data.xlsx --missing auto
 
-# 分步驟
-python ipssm_pipeline.py data.xlsx --screen-only      # 僅驗證
-python ipssm_pipeline.py cleaned.csv --translate-only  # 僅 R 計算
+# 核對 data_review.xlsx 與 data_standardized.csv (必要時直接編輯 CSV)，確認後：
+# 階段 4：正式計算風險
+python ipssm_pipeline.py data_standardized.csv --calc-only
 
-# 缺失值: 跳過 或 補平均 (預設 impute)
-python ipssm_pipeline.py data.xlsx --missing skip
+# 不需要核對、想一次跑完 (階段 1~4)
+python ipssm_pipeline.py data.xlsx --missing auto --confirm
 
-# 帶驗證比對
-python ipssm_pipeline.py data.xlsx -v validation.xlsx
-
-# 來源檔案欄名不確定能否自動對應時，先唯讀掃描預覽(不寫檔、不計算)
-python ipssm_pipeline.py data.xlsx --inspect
+# 其他
+python ipssm_pipeline.py data.xlsx --screen-only      # 只做階段 1 (正規化 + 驗證)
+python ipssm_pipeline.py data.xlsx -v validation.xlsx # 帶驗證比對
+python ipssm_pipeline.py data.xlsx --inspect          # 唯讀預覽欄位對應 (不寫檔、不計算)
 ```
 
 ## 作為本地 Agent Skill 使用（Claude Code）
@@ -34,64 +35,115 @@ Claude 會自動載入 skill，先檢查依賴（Python 套件 / R / `ipssm` 套
 skill 也附了一個從任意目錄都能執行的包裝腳本：
 
 ```bash
-bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only ...]
+bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto] [--confirm ...]
 ```
 
 > 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
 > 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
 
-## 缺失值處理：跳過 或 補平均
+## 缺失值處理：`--missing skip | impute | auto`
 
-病患資料常有缺漏。執行時用 `--missing` 選擇處理方式：
+病患資料常有缺漏。三種處理方式：
 
 | 模式 | 作法 | 適用情境 |
 |---|---|---|
 | `skip` | 任何**模型輸入欄位**缺失的病患一律跳過，只計算資料完整者 | 要求結果完全建立在實測資料上 |
-| `impute`（預設） | 保留 `NA`，由官方 R 套件做 Best / Mean / Worst 三情境分析；**Mean 情境 = 以族群平均值（HB、PLT…）/ 平均突變頻率（基因）補值** | 想盡量保留病患，並看出缺失造成的不確定性 |
+| `impute`（預設） | 保留 `NA`，由官方 R 套件做 Best / Mean / Worst 三情境分析；**Mean 情境 = 以族群平均值（HB、PLT…）/ 平均突變頻率（基因）補值**；範圍過大者只標 UNCERTAIN，仍會計算 | 想保留所有病患並看出不確定性 |
+| `auto` | 先試算；缺失造成的範圍 (Worst − Best) **不超過 `--max-range`（預設 1）** 者補平均值計算，**超過者列入 UNCERTAIN 清單並排除**（區間仍保留供參考）。需要 R | 想自動決定「哪些缺失可以補、哪些不能」 |
 
-```bash
-python ipssm_pipeline.py data.xlsx --missing skip
-python ipssm_pipeline.py data.xlsx --missing impute
-```
+### 缺失的定義
 
-重點規則：
+| 儲存格內容 | 意義 | 正規化結果 |
+|---|---|---|
+| 空白、`NA`、`N/A`、`None`、`.` … | **未知**（Not Assessed）| `NA` |
+| `ND` / `Not Detected` | **有檢測、未偵測到突變**（Not Detected）| 基因、`del5q` 等二元欄位與 `TP53mut` → **`0`**；數值欄位與 `CYTO_IPSSR` 無法對應成值 → `NA` |
+| `0` | 檢測過、沒有突變 | `0` |
+| `1` | 突變 / 存在 | `1` |
 
-- **空白 = `NA` = `ND` 等**：一律視為「未知」，沒有差別。
-- **未知 ≠ `0`**：`0` 代表「檢測過、沒有突變」。基因欄位若把未檢測誤填成 `0`，會低估風險。
-- **請勿自行手動補平均值再送入**：手動補值會讓程式以為資料完整、範圍縮小而誤判為 CONFIDENT；
-  請保留空白/`NA` 讓程式處理，缺失才會被正確標記與量化。
-- 「模型輸入欄位」= 臨床（HB/PLT/BM_BLAST）、細胞遺傳學（del5q/del7_7q/del17_17p/complex/CYTO_IPSSR）、
-  `TP53mut`，以及 30 個基因欄位（`MLL_PTD`、`FLT3` 與 28 個突變基因，見 SCREENER_REFERENCE）。`TP53maxvaf`/`TP53loh` 只有在
-  `TP53mut = 1` 且無法判定 multi-hit 時才算缺失。
-- 輸出的 `Reported_Score` / `Reported_Cat` 一律是 **Mean 情境**結果；`IPSSMscore_best` /
-  `IPSSMscore_worst` 是缺失值最有利/最不利時的範圍；`Missing_Fields` / `Missing_Groups`
-  列出每位病患實際缺了什麼（clinical / cytogenetic / tp53 / genes）。
+- 空白與 `NA` **完全等價**，未知 **≠** `0`。基因欄位把未檢測誤填成 `0` 會低估風險。
+- **請勿自行手動補平均值再送入**：程式會誤以為資料完整而標成 CONFIDENT；保留空白/`NA` 才能被量化。
+- 「模型輸入欄位」= 臨床（`HB`/`PLT`/`BM_BLAST`）、細胞遺傳學（`del5q`/`del7_7q`/`del17_17p`/`complex`/`CYTO_IPSSR`）、
+  `TP53mut`，以及 30 個基因欄位。`TP53maxvaf`/`TP53loh` 只有在 `TP53mut = 1` 且無法判定 multi-hit 時才算缺失。
 
-## 流程說明
+### 哪些欄位缺失最「傷」？（單一欄位缺失造成的 Worst − Best 範圍）
+
+依官方套件公式計算，並由 `tests/test_r_integration.py` 以 R 實測驗證：
+
+| 欄位 | 範圍 | 單獨缺失即 UNCERTAIN? |
+|---|---|---|
+| `HB` | 3.95 | ✅ |
+| `BM_BLAST` | 2.03 | ✅ |
+| `TP53`（`TP53mut`，或 `TP53mut=1` 且無法判定 LOH）| 1.70 | ✅ |
+| `CYTO_IPSSR` | 1.66 | ✅ |
+| `FLT3`、`MLL_PTD` | 1.15 | ✅ |
+| `PLT` | 0.80 | 否 |
+| `NPM1`/`RUNX1`/`NRAS`/`ETV6`/`IDH2` | 0.55–0.62 | 否 |
+| 其餘基因（`CBL`/`EZH2`/`U2AF1`/`SRSF2`/`DNMT3A`/`ASXL1`/`KRAS`…）| 0.29–0.43 | 否 |
+
+單獨不超過 1 的欄位，**多個一起缺失時範圍會相加**，仍可能超過門檻。`Key_Missing_Fields` 欄位會標出
+單獨就足以造成 UNCERTAIN 的缺失欄位。
+
+## 流程說明（四階段）
 
 ```
 輸入 (Excel/CSV)
     │
     ▼
-[階段 1] 資料驗證 & 格式轉換
-    ├─ 自動偵測隊列格式 (FJUH / HSCT / 自訂)
-    ├─ 自動解析核型字符串 (Karyotype → 細胞遺傳學欄位)
-    ├─ 缺失值處理 (--missing skip | impute)
-    ├─ NA 標準化 & 數值範圍驗證
-    ├─ 產出: *_cleaned.csv + *_screening_log.txt
+[階段 1] 正規化 & 逐欄位紀錄
+    ├─ 自動偵測隊列格式、欄位別名對應、核型字串解析
+    ├─ 關鍵字/格式規則: Positive→1、neg→0、ND→0、very_good→Very Good、
+    │    "9.6 g/dL"→9.6、"96 g/L"→9.6(需確認)、TP53maxvaf "85"→0.85(需確認)…
+    ├─ (選用) LLM 輔助: 只處理規則無法解析的儲存格，附信心程度，一律需人工確認
+    ├─ 每個被改動/無法解析的儲存格都記錄: 原值 → 新值、規則、來源(rule/llm)、狀態、信心
+    ├─ 數值範圍 / 0-1 / 類別驗證 (有問題的病患排除並記錄原因，不影響其他人)
     │
     ▼
-[階段 2] R 風險計算 & 信心標記
-    ├─ 呼叫 R IPSSMwrapper 計算三種情景分數
-    ├─ Range = Worst - Best → 判斷信心等級
-    ├─ 產出: *_results.xlsx (多工作表)
+[階段 2] 試算缺失值造成的風險 (呼叫 R，Best/Mean/Worst)
+    ├─ 每位病患: 缺失欄位、缺失分組、Key_Missing_Fields、Range
+    ├─ UNCERTAIN 清單 (Range > 1)
+    ├─ auto 模式: Range > --max-range 者排除
     │
     ▼
-最終輸出 Excel
-    ├─ Summary:       ID + Reported_Score/Cat + Confidence_Level + Missing_Fields
-    ├─ R_Full_Output:  完整 R 計算數據 (65 欄)
-    └─ Analysis:       與手動驗證結果比對
+[階段 3] 產生標準欄位資料，供使用者核對與確認  ⏸ 預設停在這裡
+    ├─ *_standardized.csv   42 個標準欄位 (進入正式計算的病患，可直接編輯)
+    ├─ *_review.xlsx        Summary / Standardized / Field_Audit / Column_Summary /
+    │                        Missing_Check / Uncertain / Excluded / LLM_Review
+    ├─ *_field_audit.csv    逐欄位正規化紀錄 (機器可讀)
+    └─ *_screening_log.txt  驗證日誌
+    │
+    ▼  使用者確認 (--calc-only 或 --confirm)
+[階段 4] 正式計算風險
+    └─ *_standardized_results.xlsx
+         ├─ Summary:         ID + Reported_Score/Cat + Confidence_Level + Missing_Fields
+         ├─ R_Full_Output:   完整 R 計算數據
+         ├─ Uncertain_Excluded: auto 模式排除者的 Best/Mean/Worst 區間 (--confirm 時)
+         └─ Analysis:        與手動驗證結果比對 (有給 -v 時)
 ```
+
+輸出欄位：`Reported_Score` / `Reported_Cat` 一律是 **Mean 情境**結果；`IPSSMscore_best` / `IPSSMscore_worst`
+是缺失值最有利/最不利時的範圍。
+
+## LLM 輔助檢核（選用）
+
+規則無法解析的儲存格（例如 `"weakly positive"`）可交給 LLM 對應到允許值並給出信心程度。
+支援本地或雲端端點：
+
+```bash
+# 本地 (Ollama / LM Studio / vLLM / llama.cpp server 等 OpenAI 相容端點)，資料不離開本機
+python ipssm_pipeline.py data.xlsx --missing auto --llm \
+    --llm-endpoint http://localhost:11434/v1 --llm-model llama3.1
+
+# 雲端 (需明確同意；API key 放環境變數，不要寫在指令列)
+export ANTHROPIC_API_KEY=...
+python ipssm_pipeline.py data.xlsx --missing auto --llm --llm-provider anthropic --llm-allow-remote
+```
+
+- **只解讀、不補值**：LLM 只能把「已存在的文字」對應到允許值；無法解讀必須回 `null`。缺失值不會由 LLM 推測。
+- **最小揭露**：只送出「欄位名稱 + 允許值 + 單一儲存格原文」，**不含 ID 或同列其他欄位**；相同文字只查詢一次。
+- **遠端需明確同意**：非本地端點必須加 `--llm-allow-remote`。請先確認資料已去識別化並符合使用條款。
+- **信心門檻**：`--llm-min-confidence`（預設 0.8）；低於門檻或不在允許值內者不採用，該病患照常因資料錯誤被排除。
+- **一律人工確認**：LLM 採用的每個儲存格在 `Field_Audit` / `LLM_Review` 中標為 `needs_review`。
+- 目前僅以模擬伺服器測試傳輸與判斷邏輯，**尚未針對特定模型的實際判讀品質做評估**，請務必核對 `LLM_Review`。
 
 ## 信心等級邏輯
 
@@ -115,13 +167,13 @@ python ipssm_pipeline.py data.xlsx --missing impute
 ## 計算引擎
 
 只使用本地 R 引擎（官方 `ipssm` 套件的 `IPSSMwrapper`），完全離線，病患資料不會離開本機。
-缺失值（空白、`NA`、`ND` 等）一律標準化為 `NA`，由 R 套件做 Best / Mean / Worst 三情境分析。
+缺失值（空白、`NA` 等）標準化為 `NA`，由 R 套件做 Best / Mean / Worst 三情境分析；`ND` 視為「檢測過、無突變」。
 
 ## 測試
 
 ```bash
 pip install -r requirements.txt pytest
-pytest -q          # 純 Python 測試，不需 R 或網路
+pytest -q          # 含 R 端對端測試；找不到 Rscript / ipssm 時會自動略過那部分，不需網路
 ```
 
 ## 環境需求
