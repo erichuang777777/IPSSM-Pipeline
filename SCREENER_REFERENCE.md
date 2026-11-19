@@ -9,13 +9,13 @@
 
 ### 1.1 必填欄位 (Required Fields)
 
-缺少以下欄位的資料列會被 **直接跳過 (SKIP)**，不會進入 R 計算。
+這三欄缺失時的處理由 `--missing` 決定：`skip` 模式會 **跳過 (SKIP)** 該病患；`impute` 模式保留 `NA`，由 R 套件以 Mean 情境補值 (HB 平均 9.87、PLT/BLAST 以族群平均補值)，並在輸出中標記 `Missing_Groups = clinical`。
 
 | 欄位 | 全名 | 類型 | 有效範圍 | 單位 | 缺失處理 |
 |------|------|------|----------|------|----------|
-| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | ❌ 不可缺失 → 跳過該筆 |
-| `PLT` | Platelet count | float | 0 ~ 2000 | ×10⁹/L | ❌ 不可缺失 → 跳過該筆 |
-| `BM_BLAST` | Bone marrow blast % | float | 0 ~ 30 | % | ❌ 不可缺失 → 跳過該筆 |
+| `HB` | Hemoglobin | float | 4 ~ 20 | g/dL | 缺失 → `skip` 模式跳過該筆；`impute` / `auto` 模式交給 R 以 Mean 情境補值 |
+| `PLT` | Platelet count | float | 0 ~ 2000 | ×10⁹/L | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
+| `BM_BLAST` | Bone marrow blast % | float | 0 ~ 30 | % | 缺失 → `skip` 模式跳過該筆；`impute` 模式交給 R 補值 |
 
 > ⚠️ **HB 單位注意**: IPSS-M 標準為 **g/dL**。若您的資料使用 g/L，需先除以 10 再輸入。
 
@@ -63,19 +63,65 @@
 
 ---
 
-## 2. NA 標準化規則
+## 1.6 讀取原始檔案 (`ipssm_source.py`)
 
-Screener 會將以下字串**自動統一轉換為標準的 `NA`**：
+| 項目 | 規則 |
+|---|---|
+| 支援格式 | `.xlsx` / `.xlsm` / `.csv` / `.tsv`；`.xls` 需另存為 `.xlsx` |
+| 分頁評分 | 偵測到的表頭能對應到幾個標準欄位；≥3 個視為「像病患資料」|
+| 自動選擇 | 只有一個可見資料頁 → 選它；多個資料頁時，只有最高分者含 HB/PLT/BM_BLAST、分數不並列、且其他頁欄位皆為其子集時才選，否則要求 `--sheet` |
+| 隱藏分頁 | 不參與自動選擇 |
+| `--sheet` | 名稱、1 起算的序號、逗號分隔多頁，或 `all`（所有可見資料頁）|
+| 多頁合併 | `--sheet-join stack`（上下串接）/ `merge`（依 ID outer join，保留第一頁順序）；未指定時：各頁標準欄位相同 → stack，互斥 → merge，部分重疊 → 要求指定 |
+| merge 檢查 | 任一頁 ID 重複 → 停止；某頁缺的病患 → 該頁欄位為缺失並提示；兩頁同欄位數值不同 → 保留先出現的值並提示；非第一頁無 ID 的列略過 |
+| 表頭偵測 | 前 20 列中能對應最多標準欄位的那一列 |
+| 儲存格 | 讀公式計算結果；百分比格式 → `值×100%`；`1.0` → `1`；布林 → `TRUE`/`FALSE` |
+| CSV 編碼 | UTF-8（含 BOM）→ cp950 |
+| 病患 ID 缺失 | 以 `Row_分頁!列號` 代替，並記錄於逐欄位稽核 (`id_from_row`) |
+| 來源警告 | 未選用的資料頁、表頭非第一列、整欄缺失的 ID/HB/PLT/BM_BLAST、重複 ID、合併衝突 |
+
+---
+
+## 2. 缺失值與正規化規則
+
+### 2.1 缺失 (未知)
+
+下列字串視為**未知**，統一轉成 `NA`（空白與 `NA` 完全等價，且**不等於 `0`**）：
 
 ```
-"", " ", "NA", "N/A", "n/a", "na",
-"NaN", "nan", "None", "none", ".", "ND", "nd"
+"", " ", "NA", "N/A", "n/a", "na", "NaN", "nan", "None", "none", "."
 ```
 
-### 2.1 特殊規則: `CYTO_IPSSR` 的 `ND`
-- `ND` (Not Detected/Not Done) 在 `CYTO_IPSSR` 欄位有特殊意義
-- 被明確轉換為 `NA`，觸發 R 情境分析
-- 會在驗證日誌中記錄為 `"Converted ND (not detected) to NA"`
+### 2.2 `ND` = Not Detected（有檢測、未偵測到）
+
+`ND` **不是缺失**。依欄位型態：
+
+| 欄位型態 | `ND` 的處理 |
+|---|---|
+| 二元欄位（基因、`del5q`、`del7_7q`、`del17_17p`、`complex`、`TP53loh`、`MLL_PTD`、`FLT3`）| → `0` |
+| `TP53mut` | → `0` |
+| 數值欄位（`HB`/`PLT`/`BM_BLAST`/`TP53maxvaf`）、`CYTO_IPSSR` | 無法對應成值 → `NA` |
+
+### 2.3 關鍵字 / 格式規則（每次改動都記錄於逐欄位稽核）
+
+| 規則 (`Rule`) | 範例 | 狀態 |
+|---|---|---|
+| `na_alias` | `""` → `NA` | auto_applied |
+| `nd_not_detected_to_0` / `nd_to_na` | `ND` → `0` / `NA` | auto_applied |
+| `binary_keyword` | `Positive`/`yes`/`mut` → 1；`neg`/`wt`/`wild-type` → 0 | auto_applied；`+`、`-`、`present`、`y`、`n` 等較模糊者為 needs_review |
+| `numeric_binary` | `1.0` → `1` | auto_applied |
+| `cyto_case_normalized` | `very_good` → `Very Good` | auto_applied |
+| `tp53mut_multi_alias` | `2`、`>1`、`2+` → `2 or more`（R 套件唯一接受的寫法）| auto_applied |
+| `strip_unit` | `9.6 g/dL` → `9.6`、`9%` → `9`、`281 K/uL` → `281` | auto_applied |
+| `unit_g_per_l_to_g_per_dl` | `96 g/L` → `9.6` | needs_review |
+| `decimal_comma` | `9,6` → `9.6` | needs_review |
+| `percent_to_fraction` / `vaf_percent_assumed` | `TP53maxvaf` `85%` / `85` → `0.85` | needs_review |
+| `llm_interpretation` | LLM 對應結果（見 README「LLM 輔助檢核」）| needs_review |
+| `unparsed` | 規則（及 LLM）都無法解析 | unresolved → 該病患排除 |
+
+稽核紀錄欄位：`Row, ID, Column, Original, Normalized, Rule, Source (rule/llm/llm_rejected),
+Status (auto_applied/needs_review/unresolved), Confidence, Note`，輸出為 `*_field_audit.csv`
+與 `*_review.xlsx` 的 `Field_Audit` 工作表。值本來就正確的儲存格不產生紀錄。
 
 ---
 
@@ -86,8 +132,8 @@ Screener 會將以下字串**自動統一轉換為標準的 `NA`**：
 | 公式 | 結果 | 意義 |
 |------|------|------|
 | `Range = Worst - Best` | — | 最悲觀與最樂觀情境之間的差距 |
-| `Range < 1` | ✅ **CONFIDENT** | 缺失數據影響小，Mean 分數可信 |
-| `Range ≥ 1` | ⚠️ **UNCERTAIN** | 缺失關鍵數據，結果可能跨多個風險類別 |
+| `Range ≤ 1` | ✅ **CONFIDENT** | 缺失數據影響小，Mean 分數可信 |
+| `Range > 1` | ⚠️ **UNCERTAIN** | 缺失關鍵數據，結果可能跨多個風險類別 |
 
 ---
 
@@ -240,23 +286,26 @@ python ipssm_pipeline.py data.xlsx --inspect
     └─ 修復欄名尾部空格
     │
     ▼
-[3] _validate_row() (逐列，錯誤僅影響該列)
-    ├─ NA 標準化 (ND → NA)
-    ├─ 必填欄位檢查 → 缺失則 SKIP
+[3] _normalize_row() → _validate_row() (逐列，錯誤僅影響該列)
+    ├─ _normalize_cell(): 關鍵字/格式規則 + 逐欄位稽核 (選用 LLM 處理無法解析者)
+    ├─ skip 模式: 任何模型欄位缺失 → SKIP (impute / auto 保留 NA)
     ├─ 數值範圍檢查 → 超出則 ERROR → 該列 SKIP
     ├─ 二元欄位檢查 → 非 0/1 則 ERROR → 該列 SKIP
     └─ 分類欄位檢查 → 無效值則 ERROR → 該列 SKIP
     (註: 有錯誤的列只跳過自己並記錄原因，不影響其他病患，也不讓整批失敗)
     │
     ▼
-[4] 輸出 cleaned.csv + screening_log.txt
+[4] run_trial_calculation() → R IPSSMwrapper (Stage 2 試算)
+    ├─ Best/Mean/Worst、Range = Worst - Best
+    └─ auto 模式: Range > max_range 者排除，列入 UNCERTAIN 清單
     │
     ▼
-[5] run_translation() → R IPSSMwrapper
-    ├─ 三情境分析 (Best/Mean/Worst)
-    ├─ Range = Worst - Best
-    ├─ Confidence = CONFIDENT / UNCERTAIN
-    └─ 輸出 results.xlsx (多工作表)
+[5] 輸出 *_standardized.csv + *_review.xlsx + *_field_audit.csv + *_screening_log.txt
+    │   (停下來讓使用者核對)
+    ▼
+[6] run_translation() → R IPSSMwrapper (Stage 4 正式計算)
+    ├─ Confidence = CONFIDENT (Range ≤ 1) / UNCERTAIN (Range > 1)
+    └─ 輸出 *_standardized_results.xlsx (多工作表)
 ```
 
 ---

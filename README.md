@@ -4,19 +4,24 @@
 
 ## 快速開始
 
+流程分四個階段，**預設在階段 3 停下來讓你核對標準欄位資料**，確認後才正式計算：
+
 ```bash
-# 一鍵全流程（驗證 → R 計算 → Excel 結果）
-python ipssm_pipeline.py data.xlsx
+# 階段 1~3：正規化(含逐欄位紀錄) → 試算缺失值風險 → 產生標準欄位資料與核對檔
+python ipssm_pipeline.py data.xlsx --missing auto
 
-# 分步驟
-python ipssm_pipeline.py data.xlsx --screen-only      # 僅驗證
-python ipssm_pipeline.py cleaned.csv --translate-only  # 僅 R 計算
+# 核對 data_review.xlsx 與 data_standardized.csv (必要時直接編輯 CSV)，確認後：
+# 階段 4：正式計算風險
+python ipssm_pipeline.py data_standardized.csv --calc-only
 
-# 帶驗證比對
-python ipssm_pipeline.py data.xlsx -v validation.xlsx
+# 不需要核對、想一次跑完 (階段 1~4)
+python ipssm_pipeline.py data.xlsx --missing auto --confirm
 
-# 來源檔案欄名不確定能否自動對應時，先唯讀掃描預覽(不寫檔、不計算)
-python ipssm_pipeline.py data.xlsx --inspect
+# 其他
+python ipssm_pipeline.py data.xlsx --screen-only      # 只做階段 1 (正規化 + 驗證)
+python ipssm_pipeline.py data.xlsx -v validation.xlsx # 帶驗證比對
+python ipssm_pipeline.py data.xlsx --inspect          # 唯讀預覽分頁與欄位對應 (不寫檔、不計算)
+python ipssm_pipeline.py data.xlsx --sheet 臨床,NGS    # 指定/合併 Excel 分頁 (見「讀取原始 Excel」)
 ```
 
 ## 作為本地 Agent Skill 使用（Claude Code）
@@ -31,44 +36,150 @@ Claude 會自動載入 skill，先檢查依賴（Python 套件 / R / `ipssm` 套
 skill 也附了一個從任意目錄都能執行的包裝腳本：
 
 ```bash
-bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only ...]
+bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto] [--confirm ...]
 ```
 
-> 引擎：skill 預設走**本地 R 引擎**（離線、支援缺細胞遺傳學的情境分析）。
-> 需連網的官方 REST API 引擎仍保留在 `streamlit_app.py` 的網頁版中。
+> 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
+> 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
 
-## 流程說明
+## 讀取原始 Excel（多分頁）
+
+可以直接使用醫院匯出的原始檔案，不需先手動整理：
+
+| 狀況 | 處理方式 |
+|---|---|
+| **多個分頁**（封面、說明、資料…）| 依「欄名能對應到幾個標準欄位」評分，自動選出病患資料頁 |
+| **資料分散在多頁**（例如「臨床」頁 + 「NGS」頁）| `--sheet 臨床,NGS` 依病患 ID 合併；某頁缺的病患該頁欄位為缺失，並提示 |
+| **多批次同格式**（例如 2023、2024 各一頁）| `--sheet all` 或 `--sheet 2023,2024` 上下串接 |
+| **無法明確判斷**（兩頁同分、或像是分散在多頁）| **不猜測**，停止並說明各頁差異，請用 `--sheet` 指定 |
+| **表頭不在第一列**（上方有標題、日期列）| 掃描前 20 列，自動找到表頭 |
+| **隱藏分頁**（舊備份等）| 不參與自動選擇；可用 `--sheet` 明確指定 |
+| **百分比格式儲存格**（顯示 9%、實際存 0.09）| 還原為 `9%` 再正規化，blast 不會被讀成 0.09 |
+| 公式、`TRUE`/`FALSE`、整數型小數 `1.0` | 讀取計算結果；轉成文字後交給正規化規則 |
+| **CSV 編碼** | 自動辨識 UTF-8 與 cp950（Big5，繁中 Excel 另存 CSV 的預設）|
+| 舊版 `.xls` | 請另存為 `.xlsx` |
+
+```bash
+python ipssm_pipeline.py raw.xlsx --inspect                       # 先看每個分頁的評分與自動選擇結果
+python ipssm_pipeline.py raw.xlsx --missing auto --sheet 臨床資料,NGS結果   # 依 ID 合併兩頁
+python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
+```
+
+另外會提示：未被選用但看起來也是資料的分頁、整欄缺失的必填欄位（例如找不到 HB 欄）、重複的病患 ID、
+合併時兩頁數值衝突的欄位、沒有 ID 的列（以「分頁!列號」識別）。逐欄位紀錄的 `Row` 會標示
+`分頁!Excel 列號`，可直接回原始檔對照；核對活頁簿新增 `Source` 工作表。
+
+## 缺失值處理：`--missing skip | impute | auto`
+
+病患資料常有缺漏。三種處理方式：
+
+| 模式 | 作法 | 適用情境 |
+|---|---|---|
+| `skip` | 任何**模型輸入欄位**缺失的病患一律跳過，只計算資料完整者 | 要求結果完全建立在實測資料上 |
+| `impute`（預設） | 保留 `NA`，由官方 R 套件做 Best / Mean / Worst 三情境分析；**Mean 情境 = 以族群平均值（HB、PLT…）/ 平均突變頻率（基因）補值**；範圍過大者只標 UNCERTAIN，仍會計算 | 想保留所有病患並看出不確定性 |
+| `auto` | 先試算；缺失造成的範圍 (Worst − Best) **不超過 `--max-range`（預設 1）** 者補平均值計算，**超過者列入 UNCERTAIN 清單並排除**（區間仍保留供參考）。需要 R | 想自動決定「哪些缺失可以補、哪些不能」 |
+
+### 缺失的定義
+
+| 儲存格內容 | 意義 | 正規化結果 |
+|---|---|---|
+| 空白、`NA`、`N/A`、`None`、`.` … | **未知**（Not Assessed）| `NA` |
+| `ND` / `Not Detected` | **有檢測、未偵測到突變**（Not Detected）| 基因、`del5q` 等二元欄位與 `TP53mut` → **`0`**；數值欄位與 `CYTO_IPSSR` 無法對應成值 → `NA` |
+| `0` | 檢測過、沒有突變 | `0` |
+| `1` | 突變 / 存在 | `1` |
+
+- 空白與 `NA` **完全等價**，未知 **≠** `0`。基因欄位把未檢測誤填成 `0` 會低估風險。
+- **請勿自行手動補平均值再送入**：程式會誤以為資料完整而標成 CONFIDENT；保留空白/`NA` 才能被量化。
+- 「模型輸入欄位」= 臨床（`HB`/`PLT`/`BM_BLAST`）、細胞遺傳學（`del5q`/`del7_7q`/`del17_17p`/`complex`/`CYTO_IPSSR`）、
+  `TP53mut`，以及 30 個基因欄位。`TP53maxvaf`/`TP53loh` 只有在 `TP53mut = 1` 且無法判定 multi-hit 時才算缺失。
+
+### 哪些欄位缺失最「傷」？（單一欄位缺失造成的 Worst − Best 範圍）
+
+依官方套件公式計算，並由 `tests/test_r_integration.py` 以 R 實測驗證：
+
+| 欄位 | 範圍 | 單獨缺失即 UNCERTAIN? |
+|---|---|---|
+| `HB` | 3.95 | ✅ |
+| `BM_BLAST` | 2.03 | ✅ |
+| `TP53`（`TP53mut`，或 `TP53mut=1` 且無法判定 LOH）| 1.70 | ✅ |
+| `CYTO_IPSSR` | 1.66 | ✅ |
+| `FLT3`、`MLL_PTD` | 1.15 | ✅ |
+| `PLT` | 0.80 | 否 |
+| `NPM1`/`RUNX1`/`NRAS`/`ETV6`/`IDH2` | 0.55–0.62 | 否 |
+| 其餘基因（`CBL`/`EZH2`/`U2AF1`/`SRSF2`/`DNMT3A`/`ASXL1`/`KRAS`…）| 0.29–0.43 | 否 |
+
+單獨不超過 1 的欄位，**多個一起缺失時範圍會相加**，仍可能超過門檻。`Key_Missing_Fields` 欄位會標出
+單獨就足以造成 UNCERTAIN 的缺失欄位。
+
+## 流程說明（四階段）
 
 ```
 輸入 (Excel/CSV)
     │
     ▼
-[階段 1] 資料驗證 & 格式轉換
-    ├─ 自動偵測隊列格式 (FJUH / HSCT / 自訂)
-    ├─ 自動解析核型字符串 (Karyotype → 細胞遺傳學欄位)
-    ├─ 必填欄位檢查 (HB, PLT, BM_BLAST)
-    ├─ NA 標準化 & 數值範圍驗證
-    ├─ 產出: *_cleaned.csv + *_screening_log.txt
+[階段 1] 正規化 & 逐欄位紀錄
+    ├─ 讀取原始檔: 自動選分頁 / 多分頁合併 (--sheet)、表頭偵測、百分比格式、CSV 編碼
+    ├─ 自動偵測隊列格式、欄位別名對應、核型字串解析
+    ├─ 關鍵字/格式規則: Positive→1、neg→0、ND→0、very_good→Very Good、
+    │    "9.6 g/dL"→9.6、"96 g/L"→9.6(需確認)、TP53maxvaf "85"→0.85(需確認)…
+    ├─ (選用) LLM 輔助: 只處理規則無法解析的儲存格，附信心程度，一律需人工確認
+    ├─ 每個被改動/無法解析的儲存格都記錄: 原值 → 新值、規則、來源(rule/llm)、狀態、信心
+    ├─ 數值範圍 / 0-1 / 類別驗證 (有問題的病患排除並記錄原因，不影響其他人)
     │
     ▼
-[階段 2] R 風險計算 & 信心標記
-    ├─ 呼叫 R IPSSMwrapper 計算三種情景分數
-    ├─ Range = Worst - Best → 判斷信心等級
-    ├─ 產出: *_results.xlsx (多工作表)
+[階段 2] 試算缺失值造成的風險 (呼叫 R，Best/Mean/Worst)
+    ├─ 每位病患: 缺失欄位、缺失分組、Key_Missing_Fields、Range
+    ├─ UNCERTAIN 清單 (Range > 1)
+    ├─ auto 模式: Range > --max-range 者排除
     │
     ▼
-最終輸出 Excel
-    ├─ Summary:       ID + Confidence_Level
-    ├─ R_Full_Output:  完整 R 計算數據 (65 欄)
-    └─ Analysis:       與手動驗證結果比對
+[階段 3] 產生標準欄位資料，供使用者核對與確認  ⏸ 預設停在這裡
+    ├─ *_standardized.csv   42 個標準欄位 (進入正式計算的病患，可直接編輯)
+    ├─ *_review.xlsx        Summary / Source / Standardized / Field_Audit / Column_Summary /
+    │                        Missing_Check / Uncertain / Excluded / LLM_Review
+    ├─ *_field_audit.csv    逐欄位正規化紀錄 (機器可讀)
+    └─ *_screening_log.txt  驗證日誌
+    │
+    ▼  使用者確認 (--calc-only 或 --confirm)
+[階段 4] 正式計算風險
+    └─ *_standardized_results.xlsx
+         ├─ Summary:         ID + Reported_Score/Cat + Confidence_Level + Missing_Fields
+         ├─ R_Full_Output:   完整 R 計算數據
+         ├─ Uncertain_Excluded: auto 模式排除者的 Best/Mean/Worst 區間 (--confirm 時)
+         └─ Analysis:        與手動驗證結果比對 (有給 -v 時)
 ```
+
+輸出欄位：`Reported_Score` / `Reported_Cat` 一律是 **Mean 情境**結果；`IPSSMscore_best` / `IPSSMscore_worst`
+是缺失值最有利/最不利時的範圍。
+
+## LLM 輔助檢核（選用）
+
+規則無法解析的儲存格（例如 `"weakly positive"`）可交給 LLM 對應到允許值並給出信心程度。
+支援本地或雲端端點：
+
+```bash
+# 本地 (Ollama / LM Studio / vLLM / llama.cpp server 等 OpenAI 相容端點)，資料不離開本機
+python ipssm_pipeline.py data.xlsx --missing auto --llm \
+    --llm-endpoint http://localhost:11434/v1 --llm-model llama3.1
+
+# 雲端 (需明確同意；API key 放環境變數，不要寫在指令列)
+export ANTHROPIC_API_KEY=...
+python ipssm_pipeline.py data.xlsx --missing auto --llm --llm-provider anthropic --llm-allow-remote
+```
+
+- **只解讀、不補值**：LLM 只能把「已存在的文字」對應到允許值；無法解讀必須回 `null`。缺失值不會由 LLM 推測。
+- **最小揭露**：只送出「欄位名稱 + 允許值 + 單一儲存格原文」，**不含 ID 或同列其他欄位**；相同文字只查詢一次。
+- **遠端需明確同意**：非本地端點必須加 `--llm-allow-remote`。請先確認資料已去識別化並符合使用條款。
+- **信心門檻**：`--llm-min-confidence`（預設 0.8）；低於門檻或不在允許值內者不採用，該病患照常因資料錯誤被排除。
+- **一律人工確認**：LLM 採用的每個儲存格在 `Field_Audit` / `LLM_Review` 中標為 `needs_review`。
+- 目前僅以模擬伺服器測試傳輸與判斷邏輯，**尚未針對特定模型的實際判讀品質做評估**，請務必核對 `LLM_Review`。
 
 ## 信心等級邏輯
 
 | 條件 | 標記 | 意義 |
 |------|------|------|
-| Range < 1 | **CONFIDENT** ✅ | 缺失數據影響小，Mean 分數可信 |
-| Range ≥ 1 | **UNCERTAIN** ⚠️ | 缺失關鍵數據，結果跨多個風險類別 |
+| Range ≤ 1 | **CONFIDENT** ✅ | 缺失數據影響小，Mean 分數可信 |
+| Range > 1 | **UNCERTAIN** ⚠️ | 缺失關鍵數據，結果跨多個風險類別 |
 
 > 詳見 [SCREENER_REFERENCE.md](SCREENER_REFERENCE.md) 了解完整欄位規格、函數說明、與核型解析規則。
 
@@ -82,48 +193,34 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--screen-only .
   底線)能對到 `COLUMN_ALIASES`，無論是否偵測到已知的 FJUH/HSCT 特徵欄都會嘗試轉換。
   來源檔案欄名不確定時，建議先跑 `--inspect` 預覽對應結果，見上方「快速開始」。
 
-## ⚠️ 計算引擎差異聲明
+## 計算引擎
 
-本專案提供兩套**分別維護**的 IPSS-M 計算實作，兩者的計算規則、缺失資料處理方式不完全相同：
-
-| | R 引擎 (本地 `ipssm` 套件，CLI/skill 預設) | 官方 Web API (`api.mds-risk-model.com`，Streamlit 網頁版選項) |
-|---|---|---|
-| 執行方式 | 完全離線 | 需連網 |
-| 缺 `CYTO_IPSSR` | 支援情境分析 (Best/Mean/Worst + 信心等級) | **嚴格要求**，缺少會回傳 `Error 400` |
-| 版本同步 | 隨本專案/`ipssm` 套件版本 | 隨官方伺服器版本，可能不同步 |
-
-**即使兩邊輸入資料都完整，也不保證計算出的數值完全一致**（畢竟是兩套獨立維護的實作）。
-因此：
-- **請勿在同一份報告或同一批次分析中混用兩引擎的結果。**
-- 交付結果時，務必標明該筆分數是由哪個引擎產生（本地 R 引擎 或 官方 REST API）。
-- 若發現本機 CLI/skill 算出的分數與網頁 API 版本不同，這是**預期的引擎差異**，
-  不代表任一邊有 bug。
+只使用本地 R 引擎（官方 `ipssm` 套件的 `IPSSMwrapper`），完全離線，病患資料不會離開本機。
+缺失值（空白、`NA` 等）標準化為 `NA`，由 R 套件做 Best / Mean / Worst 三情境分析；`ND` 視為「檢測過、無突變」。
 
 ## 測試
 
 ```bash
 pip install -r requirements.txt pytest
-pytest -q          # 純 Python 測試，不需 R 或網路
+pytest -q          # 含 R 端對端測試；找不到 Rscript / ipssm 時會自動略過那部分，不需網路
 ```
 
 ## 環境需求
 
-- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`, `requests`；測試另需 `pytest`）
-- **R** ≥ 4.3.0（需安裝 `ipssm` 套件）
+- **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`；測試另需 `pytest`）
+- **R** ≥ 4.3.0（需安裝 `ipssm` 套件，可執行 `Rscript install.R` 安裝）
 - Rscript 路徑可用環境變數 `IPSSM_RSCRIPT` 覆寫（跨平台自動偵測）
 
 ## 專案結構
 
 ```
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
-├── streamlit_app.py           # Streamlit 網頁介面
 ├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
-├── tests/                     # pytest 測試 (karyotype / validation / cohort / api)
+├── tests/                     # pytest 測試 (karyotype / validation / cohort)
 ├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
 ├── README.md                  # 本文件
 │
-├── install.R                  # Streamlit Cloud R 安裝腳本
-├── packages.txt               # Streamlit Cloud apt 依賴
+├── install.R                  # 本地安裝 ipssm R 套件
 ├── requirements.txt           # Python 依賴
 ├── .gitignore                 # Git 忽略規則
 │
@@ -145,12 +242,12 @@ pytest -q          # 純 Python 測試，不需 R 或網路
 
 ## 法律與合規注意事項 (Terms of Use / Compliance)
 
-開發與使用本系統需嚴格遵守 MSKCC (Memorial Sloan Kettering Cancer Center) 官方 IPSS-M API 使用條款。請注意以下限制：
+開發與使用本系統需嚴格遵守 MSKCC (Memorial Sloan Kettering Cancer Center) 官方 IPSS-M 使用條款。請注意以下限制：
 
 1. **🚫 絕對禁止用於臨床醫療與診斷**：
    本工具算出的分數 **僅限學術研究 (Academic Research) 參考使用**。嚴禁將計算結果用於真實病患之診斷、治療決策，或產生任何醫院的官方醫療報告。
 2. **🚫 禁止傳輸病患個資 (PHI/PII)**：
-   不得上傳含有「真實姓名」、「身分證字號」等足資辨識個人身分的Protected Health Information (PHI)。系統會自動過濾 `ID` 欄位不傳送至國外伺服器以保護隱私，但其餘欄位請確保皆已去識別化。
+   不得上傳含有「真實姓名」、「身分證字號」等足資辨識個人身分的Protected Health Information (PHI)。本工具完全在本機執行、不傳送資料，但輸入檔請確保已去識別化。
 3. **🚫 禁止商業用途**：
    嚴格禁止將此工具或產生之結果用於任何商業目的，除非已取得 MSK 之明示書面授權。
 4. **⚠️ 發表論文限制**：
