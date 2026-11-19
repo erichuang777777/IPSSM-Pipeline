@@ -125,6 +125,7 @@ python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
     ├─ (選用) LLM 輔助: 只處理規則無法解析的儲存格，附信心程度，一律需人工確認
     ├─ 每個被改動/無法解析的儲存格都記錄: 原值 → 新值、規則、來源(rule/llm)、狀態、信心
     ├─ 數值範圍 / 0-1 / 類別驗證 (有問題的病患排除並記錄原因，不影響其他人)
+    ├─ 跨欄位一致性檢查 (C01–C09，只警告)
     │
     ▼
 [階段 2] 試算缺失值造成的風險 (呼叫 R，Best/Mean/Worst)
@@ -135,7 +136,7 @@ python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
     ▼
 [階段 3] 產生標準欄位資料，供使用者核對與確認  ⏸ 預設停在這裡
     ├─ *_standardized.csv   42 個標準欄位 (進入正式計算的病患，可直接編輯)
-    ├─ *_review.xlsx        Summary / Source / Standardized / Field_Audit / Column_Summary /
+    ├─ *_review.xlsx        Summary / Source / Standardized / Field_Audit / Column_Summary / Consistency /
     │                        Missing_Check / Uncertain / Excluded / LLM_Review
     ├─ *_field_audit.csv    逐欄位正規化紀錄 (機器可讀)
     └─ *_screening_log.txt  驗證日誌
@@ -143,7 +144,7 @@ python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
     ▼  使用者確認 (--calc-only 或 --confirm)
 [階段 4] 正式計算風險
     └─ *_standardized_results.xlsx
-         ├─ Summary:         ID + Reported_Score/Cat + Confidence_Level + Missing_Fields
+         ├─ Summary:         ID + Reported_Score/Cat + Confidence_Level + Missing_Fields + Consistency_Flags
          ├─ R_Full_Output:   完整 R 計算數據
          ├─ Uncertain_Excluded: auto 模式排除者的 Best/Mean/Worst 區間 (--confirm 時)
          └─ Analysis:        與手動驗證結果比對 (有給 -v 時)
@@ -151,6 +152,30 @@ python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
 
 輸出欄位：`Reported_Score` / `Reported_Cat` 一律是 **Mean 情境**結果；`IPSSMscore_best` / `IPSSMscore_worst`
 是缺失值最有利/最不利時的範圍。
+
+## 跨欄位一致性檢查（只警告）
+
+欄位各自合法、但**彼此矛盾**的資料，會在核對活頁簿的 `Consistency` 工作表、日誌，以及最終結果的
+`Consistency_Flags` 欄位標出。**只警告：不排除病患、不修改資料**，由醫師判斷是否為真正的錯誤。
+缺失值不會觸發旗標。
+
+| 規則 | 嚴重度 | 內容 |
+|---|---|---|
+| C01 | conflict | `TP53mut = 0` 但 `TP53maxvaf > 0` |
+| C02 | conflict | `TP53mut ≥ 1` 但 `TP53maxvaf = 0` |
+| C03 | note | `TP53mut = 0` 但 `TP53loh = 1`（對結果沒有影響）|
+| C04 | note | `TP53mut = 1`、`TP53loh = 0`，但 VAF > 0.55 或 `del17_17p = 1`：**模型會把 TP53loh 覆寫為 1**，TP53 判為 multi-hit，分數明顯變高 |
+| C05 | conflict | `complex = 1` 但 `CYTO_IPSSR` 是 Very Good / Good / Intermediate |
+| C06 | conflict | `CYTO_IPSSR = Very Poor`（複雜核型 >3 個異常）但 `complex = 0` |
+| C07 | conflict | `del7_7q = 1` 但 `CYTO_IPSSR` 是 Very Good / Good |
+| C08 | conflict | `del5q = 1` 但 `CYTO_IPSSR = Very Good` |
+| C09 | note | `BM_BLAST > 20%`：模型以 20% 計算 |
+
+- C01–C04 對應 `ipssm` 套件對 TP53 的處理；C05–C08 依據 IPSS-R 細胞遺傳學風險分組的定義。
+  由核型字串自動解析出的細胞遺傳學欄位彼此本來就一致，矛盾通常來自人工填寫。
+- **不含「臨床正常值」檢查**（例如 HB 多高不合理），因為沒有權威的 MDS 參考範圍可依據；
+  輸入範圍（HB 4–20 等）檢查另有，超出範圍的病患會被排除。
+- 正式計算（階段 4）會依「核對後的標準欄位資料」重新計算旗標，所以醫師修正資料後，旗標會跟著更新。
 
 ## LLM 輔助檢核（選用）
 

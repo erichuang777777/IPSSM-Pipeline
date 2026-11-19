@@ -146,7 +146,7 @@ This **stops before the formal calculation** and writes next to the input:
 - `<stem>_standardized.csv` — the 42 standard columns for the patients that will be
   calculated (editable).
 - `<stem>_review.xlsx` — `Summary`, `Source`, `Standardized`, `Field_Audit`, `Column_Summary`,
-  `Missing_Check`, `Uncertain`, `Excluded` (+ `LLM_Review` if LLM was used).
+  `Missing_Check`, `Consistency`, `Uncertain`, `Excluded` (+ `LLM_Review` if LLM was used).
 - `<stem>_field_audit.csv` — every normalized cell: original → new value, rule, source
   (`rule` / `llm`), status (`auto_applied` / `needs_review` / `unresolved`), confidence.
 - `<stem>_screening_log.txt`.
@@ -182,7 +182,13 @@ tell the user, in a short list:
 2. **Missing values**: how many patients have missing fields, by group (clinical /
    cytogenetic / tp53 / genes), and the **UNCERTAIN list** (ID, missing fields,
    Best/Mean/Worst, Range) — `auto` excludes them, `impute` keeps but flags them.
-3. **Standardized data**: how many patients will be calculated, and where
+3. **Consistency conflicts** (`Consistency` sheet, `CONSISTENCY CHECKS` in the log): list the
+   `conflict` rows (e.g. `TP53mut=0` but `TP53maxvaf=0.8`; `complex=1` but `CYTO_IPSSR=Good`)
+   and the `note` rows that change the result (**C04: the model overrides `TP53loh=0` to 1**).
+   These are warnings only — nothing was excluded or changed. Ask the physician which value
+   is right; corrections go into `<stem>_standardized.csv` (flags are recomputed at the
+   formal calculation, so they update). Do not "fix" these yourself.
+4. **Standardized data**: how many patients will be calculated, and where
    `<stem>_standardized.csv` / `<stem>_review.xlsx` are. Offer `SendUserFile` for the review
    workbook.
 
@@ -200,7 +206,7 @@ said they don't want a review step.)
 
 Output `<stem>_standardized_results.xlsx` — **the deliverable**:
   - `Summary` — `ID`, `Reported_Score`, `Reported_Cat`, `Confidence_Level`,
-    `Missing_Fields` (UNCERTAIN rows highlighted red).
+    `Missing_Fields`, `Consistency_Flags` (UNCERTAIN rows highlighted red).
   - `R_Full_Output` — full R output per patient, incl. `IPSSMscore_best/mean/worst`,
     `Range_Score`, `Used_Scenario_Analysis`, `Missing_Fields`, `Missing_Groups`,
     `Key_Missing_Fields`.
