@@ -20,7 +20,8 @@ python ipssm_pipeline.py data.xlsx --missing auto --confirm
 # 其他
 python ipssm_pipeline.py data.xlsx --screen-only      # 只做階段 1 (正規化 + 驗證)
 python ipssm_pipeline.py data.xlsx -v validation.xlsx # 帶驗證比對
-python ipssm_pipeline.py data.xlsx --inspect          # 唯讀預覽欄位對應 (不寫檔、不計算)
+python ipssm_pipeline.py data.xlsx --inspect          # 唯讀預覽分頁與欄位對應 (不寫檔、不計算)
+python ipssm_pipeline.py data.xlsx --sheet 臨床,NGS    # 指定/合併 Excel 分頁 (見「讀取原始 Excel」)
 ```
 
 ## 作為本地 Agent Skill 使用（Claude Code）
@@ -40,6 +41,33 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
 
 > 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
 > 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
+
+## 讀取原始 Excel（多分頁）
+
+可以直接使用醫院匯出的原始檔案，不需先手動整理：
+
+| 狀況 | 處理方式 |
+|---|---|
+| **多個分頁**（封面、說明、資料…）| 依「欄名能對應到幾個標準欄位」評分，自動選出病患資料頁 |
+| **資料分散在多頁**（例如「臨床」頁 + 「NGS」頁）| `--sheet 臨床,NGS` 依病患 ID 合併；某頁缺的病患該頁欄位為缺失，並提示 |
+| **多批次同格式**（例如 2023、2024 各一頁）| `--sheet all` 或 `--sheet 2023,2024` 上下串接 |
+| **無法明確判斷**（兩頁同分、或像是分散在多頁）| **不猜測**，停止並說明各頁差異，請用 `--sheet` 指定 |
+| **表頭不在第一列**（上方有標題、日期列）| 掃描前 20 列，自動找到表頭 |
+| **隱藏分頁**（舊備份等）| 不參與自動選擇；可用 `--sheet` 明確指定 |
+| **百分比格式儲存格**（顯示 9%、實際存 0.09）| 還原為 `9%` 再正規化，blast 不會被讀成 0.09 |
+| 公式、`TRUE`/`FALSE`、整數型小數 `1.0` | 讀取計算結果；轉成文字後交給正規化規則 |
+| **CSV 編碼** | 自動辨識 UTF-8 與 cp950（Big5，繁中 Excel 另存 CSV 的預設）|
+| 舊版 `.xls` | 請另存為 `.xlsx` |
+
+```bash
+python ipssm_pipeline.py raw.xlsx --inspect                       # 先看每個分頁的評分與自動選擇結果
+python ipssm_pipeline.py raw.xlsx --missing auto --sheet 臨床資料,NGS結果   # 依 ID 合併兩頁
+python ipssm_pipeline.py raw.xlsx --missing auto --sheet all --sheet-join stack
+```
+
+另外會提示：未被選用但看起來也是資料的分頁、整欄缺失的必填欄位（例如找不到 HB 欄）、重複的病患 ID、
+合併時兩頁數值衝突的欄位、沒有 ID 的列（以「分頁!列號」識別）。逐欄位紀錄的 `Row` 會標示
+`分頁!Excel 列號`，可直接回原始檔對照；核對活頁簿新增 `Source` 工作表。
 
 ## 缺失值處理：`--missing skip | impute | auto`
 
@@ -90,6 +118,7 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
     │
     ▼
 [階段 1] 正規化 & 逐欄位紀錄
+    ├─ 讀取原始檔: 自動選分頁 / 多分頁合併 (--sheet)、表頭偵測、百分比格式、CSV 編碼
     ├─ 自動偵測隊列格式、欄位別名對應、核型字串解析
     ├─ 關鍵字/格式規則: Positive→1、neg→0、ND→0、very_good→Very Good、
     │    "9.6 g/dL"→9.6、"96 g/L"→9.6(需確認)、TP53maxvaf "85"→0.85(需確認)…
@@ -106,7 +135,7 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
     ▼
 [階段 3] 產生標準欄位資料，供使用者核對與確認  ⏸ 預設停在這裡
     ├─ *_standardized.csv   42 個標準欄位 (進入正式計算的病患，可直接編輯)
-    ├─ *_review.xlsx        Summary / Standardized / Field_Audit / Column_Summary /
+    ├─ *_review.xlsx        Summary / Source / Standardized / Field_Audit / Column_Summary /
     │                        Missing_Check / Uncertain / Excluded / LLM_Review
     ├─ *_field_audit.csv    逐欄位正規化紀錄 (機器可讀)
     └─ *_screening_log.txt  驗證日誌

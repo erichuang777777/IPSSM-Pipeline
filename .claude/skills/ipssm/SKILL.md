@@ -94,6 +94,23 @@ Decide what to do next:
 - Never silently proceed past a missing required field without telling the user —
   those patients get dropped from the results.
 
+### Multi-sheet Excel (raw hospital exports)
+
+`--inspect` also prints every sheet with its score (how many standard columns it maps),
+detected header row, row count, and which sheet would be used. Raw files often have a cover
+sheet, title rows above the header, hidden backup sheets, or data split across sheets.
+
+- If the run stops with **`ERROR (來源檔案)`** (exit code 2), the sheet choice is ambiguous —
+  e.g. a clinical sheet + an NGS/gene sheet, or two batches with the same layout. **Do not
+  guess.** Show the user the sheet list from the message and ask (`AskUserQuestion`):
+  merge by ID (`--sheet 臨床,NGS`), stack batches (`--sheet all` / `--sheet A,B`
+  with `--sheet-join stack`), or use a single sheet (`--sheet NAME`).
+- After a run, mention any `[SOURCE WARNING]` lines: unused sheets that look like data,
+  header not on row 1, a whole required column absent (e.g. no HB column), duplicate IDs,
+  patients missing from one of the merged sheets, merge conflicts.
+- `Row` in the field audit is `sheet!excel_row`, so the user can find the cell in the
+  original file. `.xls` must be re-saved as `.xlsx`.
+
 ## Step 1.6 — Ask how to handle missing values (always ask)
 
 Real cohorts have gaps. Before running, ask the user (use `AskUserQuestion`) which
@@ -128,13 +145,13 @@ python3 ipssm_pipeline.py <input.csv|xlsx> --missing auto        # or impute / s
 This **stops before the formal calculation** and writes next to the input:
 - `<stem>_standardized.csv` — the 42 standard columns for the patients that will be
   calculated (editable).
-- `<stem>_review.xlsx` — `Summary`, `Standardized`, `Field_Audit`, `Column_Summary`,
+- `<stem>_review.xlsx` — `Summary`, `Source`, `Standardized`, `Field_Audit`, `Column_Summary`,
   `Missing_Check`, `Uncertain`, `Excluded` (+ `LLM_Review` if LLM was used).
 - `<stem>_field_audit.csv` — every normalized cell: original → new value, rule, source
   (`rule` / `llm`), status (`auto_applied` / `needs_review` / `unresolved`), confidence.
 - `<stem>_screening_log.txt`.
 
-Flags: `--max-range N` (auto threshold), `--screen-only` (stage 1 only), `--rscript PATH`,
+Flags: `--sheet NAME|N|A,B|all` and `--sheet-join stack|merge` (Excel sheets), `--max-range N` (auto threshold), `--screen-only` (stage 1 only), `--rscript PATH`,
 `-v validation.xlsx`.
 
 ### Optional: LLM help for cells the rules cannot parse

@@ -30,6 +30,11 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
+from ipssm_source import (
+    META_COLUMNS, META_ROW, META_SHEET, SHEET_JOINS, SourceSelectionError,
+    describe_source, load_table,
+)
+
 
 # ============================================================================
 #  常數定義
@@ -411,15 +416,20 @@ def find_column_mapping(input_df):
     return mapping
 
 
-def _read_any_table(input_path):
-    """讀取 CSV 或 Excel 為 DataFrame(皆為字串型別)，供 inspect/cohort 轉換共用。"""
-    input_path = Path(input_path)
-    if input_path.suffix.lower() == '.xlsx':
-        return pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
-    return pd.read_csv(input_path, dtype=str, keep_default_na=False)
+def _load_source(input_path, sheet=None, sheet_join=None):
+    """
+    讀取原始檔案 (Excel 多分頁 / CSV) 為單一 DataFrame (全字串，含來源位置欄)。
+    分頁自動選擇、表頭偵測、多分頁合併等規則見 ipssm_source.py。
+    回傳 (df, info)；無法明確決定來源時拋出 SourceSelectionError。
+    """
+    return load_table(input_path, find_column_mapping, sheet=sheet, sheet_join=sheet_join)
 
 
-def inspect_columns(input_path):
+def _data_columns(df):
+    return [c for c in df.columns if c not in META_COLUMNS]
+
+
+def inspect_columns(input_path, sheet=None, sheet_join=None):
     """
     唯讀掃描來源檔案標題並回報欄位對應狀況，不寫任何輸出檔、不執行驗證或計算。
 
@@ -434,8 +444,10 @@ def inspect_columns(input_path):
       missing_optional:       選填但未匹配到的標準欄位 — 安全填為 NA
       unmapped_input_columns: 來源欄位中未對應到任何標準欄位的欄名
       warnings:               健檢提示 (例如 HB 數值量級疑似單位錯誤)
+      source:                 來源檔案資訊 (各分頁評分、選用的分頁、表頭列、合併方式、警告)
     """
-    df = _read_any_table(input_path)
+    df, source = _load_source(input_path, sheet, sheet_join)
+    df = df[_data_columns(df)]
 
     cohort_type = detect_cohort_type(df)
     mapping = find_column_mapping(df)
@@ -465,6 +477,7 @@ def inspect_columns(input_path):
         'missing_optional': missing_optional,
         'unmapped_input_columns': unmapped_input_columns,
         'warnings': warnings,
+        'source': source,
     }
 
 
@@ -473,6 +486,10 @@ def print_inspect_report(result):
     print(f"\n{'='*60}")
     print(f"  欄位掃描預覽 (--inspect，唯讀，不寫入任何輸出檔)")
     print(f"{'='*60}")
+    for line in describe_source(result['source']):
+        print(f"  {line}")
+    for w in result['source']['warnings']:
+        print(f"  [SOURCE] {w}")
     print(f"  偵測隊列類型: {result['cohort_type']} (僅供參考)")
     print(f"  來源欄位數:   {len(result['input_columns'])}")
 
@@ -526,6 +543,8 @@ class ValidationReport:
         self.excluded = []           # 結構化排除清單: ID / Row / Source / Reason
         self.imputed_patients = []   # (patient_id, [missing fields]) — 交給 R 補值者
         self.llm_results = []        # LLMResult 清單 (若啟用 LLM)
+        self.source_info = None      # ipssm_source.load_table 的 info (分頁、表頭、合併)
+        self.source_warnings = []    # 來源檔案層級的警告 (未選用的資料分頁、重複 ID、缺整欄…)
         self.missing_mode = DEFAULT_MISSING_MODE
         self.input_rows = 0
         self.output_rows = 0
@@ -574,6 +593,12 @@ class ValidationReport:
             f"{len(self.cell_audit)} NORMALIZED CELLS ({n_review} need review, "
             f"{n_unres} unresolved), {len(self.skipped_patients)} SKIPPED\n"
         ]
+        if self.source_info:
+            lines.append("\n--- SOURCE FILE ---")
+            for line in describe_source(self.source_info):
+                lines.append(f"  {line}")
+            for w in self.source_warnings:
+                lines.append(f"  [SOURCE WARNING] {w}")
         if self.format_conversions:
             lines.append("\n--- FORMAT CONVERSIONS ---")
             for conv in self.format_conversions[:10]:
@@ -637,20 +662,7 @@ class ValidationReport:
         return '\n'.join(lines) + '\n'
 
 
-def _read_input_file(input_path):
-    """讀取 CSV 或 Excel 檔案，回傳 (rows_list, fieldnames)"""
-    input_path = Path(input_path)
-    if input_path.suffix.lower() == '.xlsx':
-        df = pd.read_excel(input_path, sheet_name=0, dtype=str, keep_default_na=False)
-        return df.to_dict('records'), list(df.columns)
-    with open(input_path, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        fieldnames = reader.fieldnames if reader.fieldnames else []
-    return rows, fieldnames
-
-
-def _try_convert_cohort(input_path, report):
+def _try_convert_cohort(input_path, report, sheet=None, sheet_join=None):
     """
     嘗試自動偵測並轉換輸入檔案的隊列格式。
 
@@ -660,15 +672,27 @@ def _try_convert_cohort(input_path, report):
       3. 若有 karyotype 欄位，自動解析為細胞遺傳學欄位
       4. 補齊缺失欄位為 'NA'
 
-    回傳 (rows, fieldnames, converted: bool)
+    回傳 (rows, fieldnames, converted: bool)；每列含來源位置欄 (META_SHEET / META_ROW)。
+    來源檔案無法明確決定 (例如多個分頁都像資料) 時拋出 SourceSelectionError。
     """
+    df, info = _load_source(input_path, sheet, sheet_join)
+    report.source_info = info
+    report.source_warnings.extend(info['warnings'])
     try:
-        input_path = Path(input_path)
-        df = _read_any_table(input_path)
+        data_cols = _data_columns(df)
+        cohort_type = detect_cohort_type(df[data_cols])
+        mapping = find_column_mapping(df[data_cols])
+        is_standard = len(mapping) == len(data_cols) and set(mapping.values()) == set(data_cols)
 
-        cohort_type = detect_cohort_type(df)
-        mapping = find_column_mapping(df)
-        is_standard = len(mapping) == len(df.columns) and set(mapping.values()) == set(df.columns)
+        absent = [c for c in ['ID', 'HB', 'PLT', 'BM_BLAST']
+                  if c not in set(mapping.values())]
+        for col in absent:
+            if col == 'ID':
+                report.source_warnings.append("來源檔案找不到病患 ID 欄位，病患將以檔案位置 (Row_...) 識別。")
+            else:
+                report.source_warnings.append(
+                    f"來源檔案找不到 {col} 欄位 (整欄缺失)：所有病患的 {col} 都會是缺失值。"
+                    f"若欄名不同，請用 --inspect 確認對應。")
 
         # 欄位對應不再只在偵測到已知隊列類型(FJUH/HSCT)時才嘗試 — 完全自訂的醫院
         # 格式(無 ethnicity/diagnosis/karyotype/transplant 等特徵欄)先前會讓 cohort_type
@@ -682,7 +706,7 @@ def _try_convert_cohort(input_path, report):
 
             # 自動解析核型欄位
             karyotype_col = None
-            for col in df.columns:
+            for col in data_cols:
                 if 'karyotype' in col.lower():
                     karyotype_col = col
                     break
@@ -731,8 +755,7 @@ def _try_convert_cohort(input_path, report):
 
     except Exception as e:
         print(f"  [CONVERSION WARNING] Could not auto-detect cohort format: {e}")
-        rows, fieldnames = _read_input_file(input_path)
-        return rows, fieldnames, False
+        return df.to_dict('records'), list(df.columns), False
 
 
 def _convert_fjuh_format(rows, fieldnames, report):
@@ -1065,7 +1088,19 @@ def _validate_row(row_idx, row, report, missing_mode=DEFAULT_MISSING_MODE):
     return len(report.errors) == errors_before
 
 
-def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=None):
+def _row_label(row, index, is_excel):
+    """來源位置: Excel 為 '分頁!列號'，CSV 為檔案列號 (int)。"""
+    sheet_name = row.pop(META_SHEET, None)
+    raw = row.pop(META_ROW, None)
+    try:
+        number = int(float(raw))
+    except (TypeError, ValueError):
+        number = index + 2
+    return f"{sheet_name}!{number}" if is_excel and sheet_name else number
+
+
+def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=None,
+                 sheet=None, sheet_join=None):
     """
     Stage 1 核心: 讀檔 -> 欄位對應/核型解析 -> 逐儲存格正規化 (含選用的 LLM) -> 驗證。
 
@@ -1079,20 +1114,28 @@ def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=Non
     report = ValidationReport()
     report.missing_mode = missing_mode
 
-    rows, fieldnames, converted = _try_convert_cohort(input_path, report)
+    rows, fieldnames, converted = _try_convert_cohort(input_path, report, sheet, sheet_join)
     if converted:
         print("  [OK] Successfully converted to standard IPSSM format\n")
 
-    report.input_cols = len(fieldnames)
+    is_excel = (report.source_info or {}).get('file_type') in ('xlsx', 'xlsm')
+    report.input_cols = len([f for f in fieldnames if f not in META_COLUMNS])
     report.input_rows = len(rows)
     rows = _convert_fjuh_format(rows, fieldnames, report)
 
     valid_rows = []
-    for row_idx, row in enumerate(rows, start=2):
+    for index, row in enumerate(rows):
         cleaned = {
-            (k.strip() if k else k): (v.strip() if isinstance(v, str) else v)
+            (k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v)
             for k, v in row.items()
         }
+        row_idx = _row_label(cleaned, index, is_excel)
+        if _is_na_value(cleaned.get('ID')):
+            new_id = f"Row_{row_idx}"
+            report.add_audit(row_idx, new_id, 'ID', str(cleaned.get('ID', '')), new_id,
+                             'id_from_row', status='auto_applied', confidence='high',
+                             note='missing patient ID replaced by source position')
+            cleaned['ID'] = new_id
         _normalize_row(row_idx, cleaned, report, llm_resolver)
 
         errors_before = len(report.errors)
@@ -1111,6 +1154,14 @@ def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=Non
                                 kind='validation', row=row_idx)
 
     final_rows = [{col: row.get(col, 'NA') for col in STANDARD_COLUMNS} for row in valid_rows]
+    id_counts = {}
+    for row in final_rows:
+        id_counts[row['ID']] = id_counts.get(row['ID'], 0) + 1
+    dups = [pid for pid, n in id_counts.items() if n > 1]
+    if dups:
+        report.source_warnings.append(
+            f"重複的病患 ID ({len(dups)} 個，結果中會出現同名的多筆): " + ', '.join(dups[:10])
+            + (' ...' if len(dups) > 10 else ''))
     report.output_rows = len(final_rows)
     report.output_cols = len(STANDARD_COLUMNS)
     if llm_resolver is not None:
@@ -1143,7 +1194,7 @@ def _write_screening_log(log_path, report_text):
 
 
 def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSING_MODE,
-                  llm_resolver=None, audit_path=None):
+                  llm_resolver=None, audit_path=None, sheet=None, sheet_join=None):
     """
     執行資料驗證（Stage 1），回傳是否成功。
 
@@ -1165,7 +1216,7 @@ def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSIN
     print(f"  缺失值模式: {missing_mode}\n")
 
     try:
-        rows, report = screen_input(input_path, missing_mode, llm_resolver)
+        rows, report = screen_input(input_path, missing_mode, llm_resolver, sheet, sheet_join)
         _write_standardized_csv(output_path, rows)
         if audit_path:
             _write_audit_csv(audit_path, report.cell_audit)
@@ -1182,6 +1233,8 @@ def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSIN
         # 不再因單筆錯誤而讓整批作廢。
         return report.output_rows > 0
 
+    except SourceSelectionError:
+        raise
     except Exception as e:
         print(f"  [ERROR] ERROR: {e}")
         import traceback
@@ -1550,7 +1603,13 @@ def _save_review_workbook(path, report, included_rows, missing_check, mode, max_
     # --- Summary ---
     ws = wb.create_sheet("Summary")
     ws.append(['項目', '內容'])
+    src = report.source_info or {}
+    src_desc = ', '.join(src.get('selected', [])) or '-'
+    if src.get('join'):
+        src_desc += f" (合併方式: {src['join']})"
     summary = [
+        ('來源分頁', src_desc),
+        ('來源檔案警告', f"{len(report.source_warnings)} 則 (見 Source 工作表)"),
         ('輸入列數', report.input_rows),
         ('缺失值模式', f"{mode}" + (f" (範圍門檻 Worst-Best <= {max_range})" if mode == 'auto' else '')),
         ('逐欄位正規化紀錄', f"{len(report.cell_audit)} 筆 (需人工確認 {n_review}、無法解析 {n_unres})"),
@@ -1566,6 +1625,20 @@ def _save_review_workbook(path, report, included_rows, missing_check, mode, max_
     for item in summary:
         ws.append(list(item))
     _style_sheet(ws, header_fill, header_font, [44, 90])
+
+    # --- Source ---
+    ws = wb.create_sheet("Source")
+    ws.append(['分頁', '狀態', '是否使用', '表頭列', '資料列數', '對應標準欄位數', '看起來是病患資料'])
+    for sh in src.get('sheets', []):
+        ws.append([sh['name'], sh['state'], 'YES' if sh['name'] in src.get('selected', []) else 'NO',
+                   sh['header_row'], sh['rows'], sh['matched'], 'YES' if sh['looks_like_data'] else 'NO'])
+    ws.append([])
+    ws.append(['來源檔案警告'])
+    for w in report.source_warnings:
+        ws.append([w])
+        for cell in ws[ws.max_row]:
+            cell.fill = review_fill
+    _style_sheet(ws, header_fill, header_font, [28, 10, 10, 8, 10, 14, 16])
 
     # --- Standardized ---
     ws = wb.create_sheet("Standardized")
@@ -1654,7 +1727,7 @@ def _build_llm_info(llm_resolver):
 
 
 def run_review_pipeline(input_path, missing_mode=DEFAULT_MISSING_MODE, max_range=DEFAULT_MAX_RANGE,
-                        rscript_path=None, llm_resolver=None):
+                        rscript_path=None, llm_resolver=None, sheet=None, sheet_join=None):
     """
     Stage 1~3: 正規化 (逐欄位紀錄, 選用 LLM) -> 試算缺失值風險 (UNCERTAIN 清單) ->
     產生標準欄位資料與核對用活頁簿。回傳結果 dict (含各輸出路徑)，失敗回傳 None。
@@ -1682,7 +1755,9 @@ def run_review_pipeline(input_path, missing_mode=DEFAULT_MISSING_MODE, max_range
         print(f"  LLM 輔助: {llm_resolver.config.provider} @ {llm_resolver.config.resolved_endpoint()} "
               f"({'遠端' if llm_resolver.is_remote else '本地'})")
     try:
-        rows, report = screen_input(input_path, missing_mode, llm_resolver)
+        rows, report = screen_input(input_path, missing_mode, llm_resolver, sheet, sheet_join)
+    except SourceSelectionError:
+        raise
     except Exception as e:
         print(f"  [ERROR] ERROR: {e}")
         import traceback
@@ -1833,6 +1908,14 @@ def main():
                              f"UNCERTAIN 清單，其餘補平均值計算 (預設 {DEFAULT_MISSING_MODE})")
     parser.add_argument('--max-range', type=float, default=DEFAULT_MAX_RANGE,
                         help=f'auto 模式的範圍門檻 (Worst-Best 超過此值視為 UNCERTAIN，預設 {DEFAULT_MAX_RANGE})')
+    parser.add_argument('--sheet',
+                        help='Excel 要讀的分頁: 名稱或序號 (1 起算)，多頁用逗號分隔 (例如 "臨床,NGS")，'
+                             '或 all (所有看起來是病患資料的可見分頁)。不指定時自動選擇最像病患資料的分頁；'
+                             '多頁分數相同時會要求指定')
+    parser.add_argument('--sheet-join', choices=SHEET_JOINS,
+                        help='多個分頁的合併方式: stack = 結構相同的分頁上下串接 (例如不同批次); '
+                             'merge = 依病患 ID 合併內容不同的分頁 (例如臨床頁 + 基因頁)。'
+                             '不指定時依欄位重疊程度自動判斷')
     parser.add_argument('--confirm', action='store_true',
                         help='階段 1~3 完成後，不再停下來核對，直接以標準欄位資料進行正式計算 (階段 4)')
     parser.add_argument('--calc-only', '--translate-only', dest='calc_only', action='store_true',
@@ -1855,7 +1938,11 @@ def main():
         sys.exit(2)
 
     if args.inspect:
-        print_inspect_report(inspect_columns(str(input_path)))
+        try:
+            print_inspect_report(inspect_columns(str(input_path), args.sheet, args.sheet_join))
+        except SourceSelectionError as e:
+            print(f"ERROR (來源檔案): {e}")
+            sys.exit(2)
         sys.exit(0)
 
     validation_path = Path(args.validation) if args.validation else None
@@ -1878,9 +1965,14 @@ def main():
     # ---- 只做階段 1 ----
     if args.screen_only:
         stem = input_path.parent / input_path.stem
-        screen_ok = run_screening(input_path, f"{stem}_standardized.csv",
-                                  f"{stem}_screening_log.txt", missing_mode=args.missing,
-                                  llm_resolver=llm_resolver, audit_path=f"{stem}_field_audit.csv")
+        try:
+            screen_ok = run_screening(input_path, f"{stem}_standardized.csv",
+                                      f"{stem}_screening_log.txt", missing_mode=args.missing,
+                                      llm_resolver=llm_resolver, audit_path=f"{stem}_field_audit.csv",
+                                      sheet=args.sheet, sheet_join=args.sheet_join)
+        except SourceSelectionError as e:
+            print(f"\nERROR (來源檔案): {e}")
+            sys.exit(2)
         if not screen_ok:
             print("\n  [ERROR] 驗證後沒有任何有效資料列可供計算，請檢查日誌。")
             sys.exit(1)
@@ -1888,7 +1980,12 @@ def main():
         sys.exit(0)
 
     # ---- 階段 1~3 ----
-    outcome = run_review_pipeline(input_path, args.missing, args.max_range, args.rscript, llm_resolver)
+    try:
+        outcome = run_review_pipeline(input_path, args.missing, args.max_range, args.rscript,
+                                      llm_resolver, args.sheet, args.sheet_join)
+    except SourceSelectionError as e:
+        print(f"\nERROR (來源檔案): {e}")
+        sys.exit(2)
     if outcome is None:
         sys.exit(1)
     std_csv = outcome['paths']['standardized']
