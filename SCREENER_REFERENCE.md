@@ -123,6 +123,11 @@
 Status (auto_applied/needs_review/unresolved), Confidence, Note`，輸出為 `*_field_audit.csv`
 與 `*_review.xlsx` 的 `Field_Audit` 工作表。值本來就正確的儲存格不產生紀錄。
 
+### 2.4 跨欄位一致性檢查 (`ipssm_checks.py`)
+
+欄位各自合法但彼此矛盾時只**警告**（不排除、不修改），規則 C01–C09 見 README「跨欄位一致性檢查」。
+缺失值不觸發旗標。輸出於 `Consistency` 工作表、日誌，以及結果的 `Consistency_Flags` 欄位。
+
 ---
 
 ## 3. 信心等級判定

@@ -30,6 +30,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
+from ipssm_checks import CONSISTENCY_RULES, check_consistency, flag_ids
 from ipssm_source import (
     META_COLUMNS, META_ROW, META_SHEET, SHEET_JOINS, SourceSelectionError,
     describe_source, load_table,
@@ -543,6 +544,7 @@ class ValidationReport:
         self.excluded = []           # 結構化排除清單: ID / Row / Source / Reason
         self.imputed_patients = []   # (patient_id, [missing fields]) — 交給 R 補值者
         self.llm_results = []        # LLMResult 清單 (若啟用 LLM)
+        self.consistency = []        # 跨欄位一致性旗標 (只警告，不排除、不改資料)
         self.source_info = None      # ipssm_source.load_table 的 info (分頁、表頭、合併)
         self.source_warnings = []    # 來源檔案層級的警告 (未選用的資料分頁、重複 ID、缺整欄…)
         self.missing_mode = DEFAULT_MISSING_MODE
@@ -576,6 +578,10 @@ class ValidationReport:
 
     def add_imputed(self, patient_id, fields):
         self.imputed_patients.append((patient_id, list(fields)))
+
+    def add_consistency(self, row, patient_id, flags):
+        for f in flags:
+            self.consistency.append({'Row': row, 'ID': patient_id, **f})
 
     def audit_counts(self):
         """依 (Rule, Status) 統計稽核紀錄筆數。"""
@@ -636,6 +642,15 @@ class ValidationReport:
                              f"'{e['Original']}' -> '{e['Normalized']}' ({e['Rule']}, {e['Source']})")
             if len(flagged) > 30:
                 lines.append(f"  ... and {len(flagged) - 30} more (see field audit file)")
+        if self.consistency:
+            n_conf = sum(1 for c in self.consistency if c['Severity'] == 'conflict')
+            lines.append(f"\n--- CONSISTENCY CHECKS ({n_conf} conflicts, "
+                         f"{len(self.consistency) - n_conf} notes; warnings only, data unchanged) ---")
+            ordered = sorted(self.consistency, key=lambda c: c['Severity'] != 'conflict')
+            for c in ordered[:30]:
+                lines.append(f"  [{c['Severity'].upper()}] {c['Rule']} ID={c['ID']} (Row {c['Row']}): {c['Message']}")
+            if len(ordered) > 30:
+                lines.append(f"  ... and {len(ordered) - 30} more (see review workbook, Consistency sheet)")
         if self.errors:
             lines.append(f"\n--- ERRORS ({len(self.errors)}) ---")
             for error in self.errors[:20]:
@@ -1142,6 +1157,8 @@ def screen_input(input_path, missing_mode=DEFAULT_MISSING_MODE, llm_resolver=Non
         skipped_before = len(report.skipped_patients)
         if _validate_row(row_idx, cleaned, report, missing_mode):
             valid_rows.append(cleaned)
+            report.add_consistency(row_idx, cleaned.get('ID', f'Row{row_idx}'),
+                                   check_consistency(cleaned))
             still_missing = missing_model_fields(cleaned)
             if still_missing:
                 report.add_imputed(cleaned.get('ID', f'Row{row_idx}'), still_missing)
@@ -1305,19 +1322,20 @@ def _save_excel(r_results, output_path, validation_data=None, extra_sheets=None)
 
     # --- Sheet 1: Summary ---
     ws = wb.create_sheet("Summary", 0)
-    ws.append(['ID', 'Reported_Score', 'Reported_Cat', 'Confidence_Level', 'Missing_Fields'])
+    ws.append(['ID', 'Reported_Score', 'Reported_Cat', 'Confidence_Level', 'Missing_Fields',
+               'Consistency_Flags'])
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
     for row in r_results:
         ws.append([row.get('ID', ''), row.get('Reported_Score', 'NA'),
                    row.get('Reported_Cat', 'NA'), row.get('Confidence_Level', 'NA'),
-                   row.get('Missing_Fields', '')])
+                   row.get('Missing_Fields', ''), row.get('Consistency_Flags', '')])
         if row.get('Confidence_Level') == 'UNCERTAIN':
             for cell in ws[ws.max_row]:
                 cell.fill = uncertain_fill
                 cell.font = uncertain_font
-    for letter, width in zip('ABCDE', [12, 15, 16, 17, 40]):
+    for letter, width in zip('ABCDEF', [12, 15, 16, 17, 40, 18]):
         ws.column_dimensions[letter].width = width
 
     # --- Sheet 2: R_Full_Output ---
@@ -1413,6 +1431,8 @@ def _annotate_missing_info(r_results, cleaned_csv_path):
             result['Missing_Fields'] = result['Missing_Groups'] = 'UNKNOWN'
             result['Key_Missing_Fields'] = 'UNKNOWN'
             result['Used_Scenario_Analysis'] = 'UNKNOWN'
+        result['Consistency_Flags'] = (
+            flag_ids(check_consistency(input_rows[i])) if aligned else 'UNKNOWN')
         result['Reported_Score'] = result.get('IPSSMscore_mean', 'NA')
         result['Reported_Cat'] = result.get('IPSSMcat_mean', 'NA')
 
@@ -1502,6 +1522,8 @@ def run_translation(input_csv, rscript_path=None, validation_path=None, extra_sh
     print(f"  CONFIDENT (range <= 1): {confident}")
     print(f"  UNCERTAIN (range > 1):  {uncertain}")
     print(f"  含缺失值 (以 Mean 情境補值): {with_missing}")
+    flagged = sum(1 for r in r_results if r.get('Consistency_Flags') not in ('NONE', 'UNKNOWN', None))
+    print(f"  有跨欄位一致性旗標 (請核對 Consistency_Flags): {flagged}")
     print(f"  總計: {len(r_results)}\n")
 
     _save_excel(r_results, excel_output, validation_data, extra_sheets)
@@ -1524,7 +1546,7 @@ MISSING_CHECK_COLUMNS = [
     'ID', 'Missing_Fields', 'Missing_Groups', 'Key_Missing_Fields',
     'IPSSMscore_best', 'IPSSMscore_mean', 'IPSSMscore_worst',
     'IPSSMcat_best', 'IPSSMcat_mean', 'IPSSMcat_worst',
-    'Range_Score', 'Confidence_Level', 'Decision',
+    'Range_Score', 'Confidence_Level', 'Decision', 'Consistency_Flags',
 ]
 
 
@@ -1564,6 +1586,7 @@ def build_missing_check(rows, trial):
             'Missing_Groups': missing_groups(fields),
             'Key_Missing_Fields': ', '.join(f for f in fields if f in STRONG_MISSING_FIELDS) or 'NONE',
             'Confidence_Level': 'NOT_COMPUTED',
+            'Consistency_Flags': flag_ids(check_consistency(row)),
         })
         if trial is not None:
             for c in MISSING_CHECK_COLUMNS[4:12]:
@@ -1599,6 +1622,8 @@ def _save_review_workbook(path, report, included_rows, missing_check, mode, max_
     for ex in report.excluded:
         kinds[ex['Source']] = kinds.get(ex['Source'], 0) + 1
     n_uncertain = sum(1 for m in missing_check if m['Confidence_Level'] == 'UNCERTAIN')
+    n_conflict = sum(1 for c in report.consistency if c['Severity'] == 'conflict')
+    n_conflict_pts = len({c['ID'] for c in report.consistency if c['Severity'] == 'conflict'})
 
     # --- Summary ---
     ws = wb.create_sheet("Summary")
@@ -1618,6 +1643,8 @@ def _save_review_workbook(path, report, included_rows, missing_check, mode, max_
         ('排除 — 缺失值 (skip 模式)', kinds.get('missing', 0)),
         ('排除 — 範圍過大 UNCERTAIN (auto 模式)', kinds.get('uncertain', 0)),
         ('試算結果中 UNCERTAIN (Range > 1)', n_uncertain if trial_available else '未試算 (找不到 R)'),
+        ('跨欄位矛盾 (只警告，資料未更動)',
+         f"{n_conflict} 項矛盾 / {n_conflict_pts} 位病患；另有 {len(report.consistency) - n_conflict} 項提示 (見 Consistency 工作表)"),
         ('進入正式計算的病患 (Standardized sheet)', len(included_rows)),
         ('LLM 輔助', llm_info or '未啟用'),
         ('下一步', '核對 Standardized / Field_Audit / Uncertain 後，確認無誤再執行正式計算 (--calc-only 或 --confirm)'),
@@ -1682,6 +1709,20 @@ def _save_review_workbook(path, report, included_rows, missing_check, mode, max_
             for cell in ws[ws.max_row]:
                 cell.fill = bad_fill
     _style_sheet(ws, header_fill, header_font, [12, 38, 24, 22] + [12] * 6 + [11, 16, 20])
+
+    # --- Consistency ---
+    ws = wb.create_sheet("Consistency")
+    ws.append(['Row', 'ID', 'Rule', 'Severity', 'Fields', 'Message'])
+    for c in sorted(report.consistency, key=lambda c: c['Severity'] != 'conflict'):
+        ws.append([c['Row'], c['ID'], c['Rule'], c['Severity'], c['Fields'], c['Message']])
+        if c['Severity'] == 'conflict':
+            for cell in ws[ws.max_row]:
+                cell.fill = bad_fill
+    ws.append([])
+    ws.append(['規則說明 (只警告，不排除病患、不修改資料)'])
+    for rule_id, (severity, text) in CONSISTENCY_RULES.items():
+        ws.append(['', '', rule_id, severity, '', text])
+    _style_sheet(ws, header_fill, header_font, [14, 14, 7, 10, 34, 90])
 
     # --- Uncertain ---
     ws = wb.create_sheet("Uncertain")
