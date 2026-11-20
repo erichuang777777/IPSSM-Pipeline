@@ -42,6 +42,41 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
 > 引擎：只有**本地 R 引擎**（離線、支援缺失值的 Best/Mean/Worst 情境分析）。
 > 已不再提供 Streamlit 網頁版與官方 REST API 引擎。
 
+## 網頁介面（給不使用終端機的使用者）
+
+不想打指令的人，可以用瀏覽器完成「上傳 → 設定 → 整理與檢查 → 核對/修改 → 確認 → 計算 → 下載」。
+所有計算與檢查仍由同一套程式完成，網頁只是外殼。
+
+**啟動**（只需準備一次：安裝 [Python 3.8+](https://www.python.org/downloads/)（Windows 安裝時勾選 *Add python.exe to PATH*），以及 R 與 ipssm 套件，網頁上會有安裝指引）：
+
+| 系統 | 做法 |
+|---|---|
+| Windows | 雙擊 `start_web.bat` |
+| macOS | 雙擊 `start_web.command` |
+| Linux | 執行 `./start_web.sh` |
+| 任何系統 | `python3 ipssm_web.py` |
+
+第一次執行會自動安裝 `pandas`、`openpyxl`（需要網路）。程式會自動開啟瀏覽器；若沒有開，請複製視窗裡顯示的網址。
+使用完畢請按網頁右上角「**結束程式**」。
+
+**畫面流程**
+1. **選擇檔案**：拖放或點選 Excel / CSV。有多個分頁時由你決定要用哪一頁、如何合併。
+2. **設定與檢查**：確認欄位對應，選擇缺失值怎麼處理（自動判斷 / 全部補平均 / 只算完整），可選用 LLM 輔助。
+3. **核對資料**：待確認清單（資料矛盾、程式替你轉換的格子）、缺失與 UNCERTAIN 的病人與風險區間、被排除的病人、
+   **可直接修改的標準欄位資料表**。填入核對者姓名並勾選確認後才會計算。
+4. **結果**：分數、風險分類、信心等級、Best–Worst 區間圖；下載結果 Excel（含核對簽核 `Review_SignOff` 與你的
+   手動修改紀錄 `Manual_Edits`）、核對檔、標準欄位 CSV、逐欄位紀錄。
+
+**可以放心的地方**
+- 只綁定本機 `127.0.0.1`，其他電腦連不到；不載入任何外部資源（沒有 CDN、字型、追蹤）。
+- 啟動時產生隨機 token，只有用啟動程式開的網址能用；也防範其他網站偷打本機服務（CSRF、DNS rebinding）。
+- 檔案放在工作資料夾（預設 `~/IPSSM_Web_Workspace`，可用 `--workspace` 指定），結果頁可按「清除這次的資料」永久刪除。
+- 關閉分頁或重新整理不會丟失進度：回到網址按「繼續上次的工作」。
+- LLM 的 API key 只存在記憶體，不會寫入檔案；遠端 LLM 必須勾選同意才會使用。
+
+**限制**：一次只處理一個計算工作；供單人在自己的電腦使用，不是多人共用的伺服器（請勿用 `--host` 之類方式對外開放，程式本來也不支援）。
+`start_web.bat` 未在 Windows 上實測（`.sh` 與主程式已在 Linux 上實測）。
+
 ## 讀取原始 Excel（多分頁）
 
 可以直接使用醫院匯出的原始檔案，不需先手動整理：
@@ -239,6 +274,8 @@ pytest -q          # 含 R 端對端測試；找不到 Rscript / ipssm 時會自
 ## 專案結構
 
 ```
+├── ipssm_web.py + web/        # 本地網頁介面 (後端 + 前端，無外部依賴)
+├── start_web.bat / .command / .sh   # 雙擊啟動網頁介面
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
 ├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
 ├── tests/                     # pytest 測試 (karyotype / validation / cohort)

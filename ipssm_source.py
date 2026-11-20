@@ -41,7 +41,11 @@ CLINICAL_REQUIRED = ('HB', 'PLT', 'BM_BLAST')
 
 
 class SourceSelectionError(ValueError):
-    """來源檔案/分頁無法明確決定時拋出 (訊息會告訴使用者該怎麼指定)。"""
+    """來源檔案/分頁無法明確決定時拋出 (訊息會告訴使用者該怎麼指定)。
+
+    若是分頁選擇造成的，會附上 .info (各分頁的評分、表頭列、列數)，供介面呈現選項。
+    """
+    info = None
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +348,11 @@ def load_table(path, map_columns: Callable[[pd.DataFrame], Dict[str, str]],
             'looks_like_data': matched >= DATA_SHEET_MIN_MATCHES and len(df) > 0,
         })
 
-    selected = _resolve_sheet_names(sheet, info['sheets']) if sheet else _auto_select(info['sheets'])
+    try:
+        selected = _resolve_sheet_names(sheet, info['sheets']) if sheet else _auto_select(info['sheets'])
+    except SourceSelectionError as e:
+        e.info = info          # 讓呼叫端 (例如網頁介面) 能列出各分頁供使用者選擇
+        raise
     info['selected'] = selected
 
     for s in info['sheets']:
@@ -363,7 +371,11 @@ def load_table(path, map_columns: Callable[[pd.DataFrame], Dict[str, str]],
         return frames[selected[0]].reset_index(drop=True), info
 
     chosen = [frames[n] for n in selected]
-    join = sheet_join or _infer_join(chosen, map_columns)
+    try:
+        join = sheet_join or _infer_join(chosen, map_columns)
+    except SourceSelectionError as e:
+        e.info = info
+        raise
     info['join'] = join
     if join == 'stack':
         std = [_standardize_frame(df, map_columns)[0] for df in chosen]
