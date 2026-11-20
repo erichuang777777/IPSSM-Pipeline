@@ -56,8 +56,9 @@ class Client:
         assert resp.status == expect, (resp.status, payload[:300])
         return json.loads(payload.decode('utf-8')) if payload else None
 
-    def upload(self, name, data, expect=200):
-        resp, payload = self.request('POST', '/api/upload?name=' + urllib.parse.quote(name), raw=data,
+    def upload(self, name, data, expect=200, terms=True):
+        url = '/api/upload?name=' + urllib.parse.quote(name) + ('&terms=1' if terms else '')
+        resp, payload = self.request('POST', url, raw=data,
                                      headers={'Content-Type': 'application/octet-stream'})
         assert resp.status == expect, (resp.status, payload[:300])
         return json.loads(payload.decode('utf-8'))
@@ -482,3 +483,111 @@ def test_frontend_escapes_hostile_patient_ids_end_to_end(app, tmp_path):
         assert run_review(client, job, missing='impute')['status'] == 'done'
         rows = client.json('GET', f'/api/jobs/{job}/rows')['rows']
         assert evil in [r['values']['ID'] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+#  使用條款確認 (整合自原 Streamlit 版的「法律與合規確認」，但改為伺服器端強制)
+# ---------------------------------------------------------------------------
+
+def test_upload_requires_terms_acceptance(app, tmp_path):
+    client, store = app
+    res = client.upload('c.csv', csv_bytes(tmp_path, [_make_row('p')]), expect=400, terms=False)
+    assert res['error'] == 'terms_required'
+    assert list((store.workspace / 'jobs').iterdir()) == []            # 沒確認就不留下任何檔案
+    ok = client.upload('c.csv', csv_bytes(tmp_path, [_make_row('p')]))
+    state = store.load_state(ok['job']['id'])
+    assert state['terms_accepted_at'] and state['terms_version'] == ipssm_web.TERMS_VERSION
+
+
+@needs_r
+def test_terms_are_recorded_in_signoff_sheet(reviewed):
+    client, store, job = reviewed
+    client.json('POST', f'/api/jobs/{job}/confirm', {'confirmed': True, 'reviewer': 'Dr. A'})
+    assert client.wait(job)['status'] == 'done'
+    resp, payload = client.request('GET', f'/api/jobs/{job}/download/results')
+    wb = load_workbook(io.BytesIO(payload))
+    signoff = {r[0].value: r[1].value for r in wb['Review_SignOff'].iter_rows(min_row=2)}
+    assert '已確認' in signoff['使用條款確認'] and '去識別化' in signoff['使用條款確認']
+
+
+def test_confirm_refused_without_terms_record(reviewed_no_r_needed):
+    client, store, job = reviewed_no_r_needed
+    state = store.load_state(job)
+    state.pop('terms_accepted_at')
+    store.save_state(job, state)
+    res = client.json('POST', f'/api/jobs/{job}/confirm', {'confirmed': True, 'reviewer': 'x'}, expect=400)
+    assert res['error'] == 'terms_required'
+
+
+@pytest.fixture
+def reviewed_no_r_needed(app, tmp_path):
+    """不需要 R: 只建立工作並放入最低限度的 review 資料，用來測試 confirm 前置檢查。"""
+    client, store = app
+    job = client.upload('c.csv', csv_bytes(tmp_path, cohort()))['job']['id']
+    store.save_review(job, {'mode': 'impute', 'max_range': 1.0, 'audit': [], 'consistency': [],
+                            'included_ids': [], 'excluded_kinds': {}, 'missing_check': [], 'excluded': [],
+                            'source': {}, 'llm': [], 'llm_info': None, 'uncertain_sheet': None,
+                            'trial_available': False, 'input_rows': 0, 'included': 0, 'seq': 0})
+    return client, store, job
+
+
+# ---------------------------------------------------------------------------
+#  環境檢查 / 自動安裝 (整合自原 Streamlit 版的 R 環境初始化)
+# ---------------------------------------------------------------------------
+
+def test_status_includes_environment_checks(app):
+    client, _ = app
+    st = client.json('GET', '/api/status')
+    ids = [c['id'] for c in st['env']['checks']]
+    assert ids[:5] == ['python', 'py:pandas', 'py:openpyxl', 'r', 'ipssm'] and 'workspace' in ids
+    assert st['r']['ready'] == (st['env']['rscript'] is not None and
+                                next(c for c in st['env']['checks'] if c['id'] == 'ipssm')['ok'])
+    assert st['installing'] is False and st['terms_version'] == ipssm_web.TERMS_VERSION
+    assert (client.json('GET', '/api/status?force=1')['env']['checks'][0]['id']) == 'python'
+
+
+def test_status_does_not_create_the_workspace_as_a_side_effect(tmp_path):
+    ws = tmp_path / 'never' / 'created'
+    from ipssm_env import check_workspace
+    res = check_workspace(ws)
+    assert res['ok'] and not ws.exists() and '尚未建立' in res['detail']
+
+
+def test_install_endpoint_is_guarded_and_reports_failure_clearly(app, monkeypatch):
+    client, _ = app
+    client.json('GET', '/api/env/install', expect=403, cookie=False)
+    assert client.json('GET', '/api/env/install')['status'] == 'idle'
+
+    monkeypatch.setattr(ipssm_web.E, 'find_rscript', lambda: None)
+    monkeypatch.setattr(ipssm_web, '_ENV_CACHE', {'at': 0.0, 'value': None, 'workspace': None})
+    res = client.json('POST', '/api/env/install', {}, expect=409)
+    assert res['error'] == 'r_missing'
+
+    monkeypatch.setattr(ipssm_web.E, 'find_rscript', lambda: '/fake/Rscript')
+    monkeypatch.setattr(ipssm_web.E, 'check_environment', lambda *a, **k: {
+        'ready': False, 'rscript': '/fake/Rscript', 'checks': [{'id': 'ipssm', 'ok': False}], 'platform': 'x', 'python': 'x'})
+    monkeypatch.setattr(ipssm_web.E, 'install_ipssm', lambda rscript, log=print, **k: (
+        log("Error: Failed to install 'ipssm' from GitHub: Could not resolve host: api.github.com"), False)[1])
+    client.json('POST', '/api/env/install', {})
+    end = time.time() + 10
+    while time.time() < end:
+        prog = client.json('GET', '/api/env/install')
+        if prog['status'] != 'running':
+            break
+        time.sleep(0.1)
+    assert prog['status'] == 'error' and prog['error']['code'] == 'install_failed'
+    assert '連不到' in prog['error']['message'] and 'Could not resolve host' in prog['log']
+    assert not ipssm_web.RUN_LOCK.locked()                              # 失敗後釋放鎖，不會卡住之後的工作
+
+
+@pytest.mark.parametrize('log,expect', [
+    ('Could not resolve host: github.com', '網路'),
+    ('Error: Failed to install from GitHub: HTTP error 403. API rate limit exceeded', '限流'),
+    ('SSL certificate problem: unable to get local issuer certificate', '網路'),
+    ("package 'readxl' is not available for this version of R", '網路'),
+    ('ERROR: failed to lock directory; lib is not writable', '權限'),
+    ('ERROR: compilation failed for package car', '編譯'),
+    ('something unexpected', '展開日誌'),
+])
+def test_install_failure_hints(log, expect):
+    assert expect in ipssm_web._install_failure_hint(log)

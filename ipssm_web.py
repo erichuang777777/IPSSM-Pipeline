@@ -14,6 +14,7 @@
 * 工作資料夾 = --workspace (預設 ~/IPSSM_Web_Workspace)，每次上傳一個獨立資料夾，
   代號是隨機 32 碼十六進位，下載只允許固定白名單的檔名，不接受任何路徑。
 * LLM 的 API key 只存在記憶體 (這次執行)，不寫入磁碟或日誌。
+* 上傳前必須確認「使用條款與合規」(伺服器端強制，並記錄於結果檔的 Review_SignOff)。
 """
 import argparse
 import contextlib
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import ipssm_env as E
 import ipssm_pipeline as P
 from ipssm_checks import check_consistency, flag_ids
 from ipssm_llm import LLMConfig, LLMResolver
@@ -43,7 +45,8 @@ from ipssm_source import SourceSelectionError
 
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / 'web'
-DEFAULT_WORKSPACE = Path.home() / 'IPSSM_Web_Workspace'
+DEFAULT_WORKSPACE = E.DEFAULT_WORKSPACE
+TERMS_VERSION = 1
 DEFAULT_MAX_UPLOAD_MB = 100
 ALLOWED_EXT = {'.xlsx', '.xlsm', '.csv', '.tsv', '.txt'}
 JOB_ID_RE = re.compile(r'^[0-9a-f]{32}$')
@@ -69,7 +72,9 @@ DOWNLOADS = {
 RUN_LOCK = threading.Lock()          # 同一時間只跑一個工作 (pipeline 會寫到 stdout)
 RUNS = {}                            # job_id -> RunState (記憶體內)
 JOB_LOCKS = {}                       # job_id -> Lock (保護 CSV/JSON 讀寫)
-_R_STATUS_CACHE = {'at': 0.0, 'value': None}
+_ENV_CACHE = {'at': 0.0, 'value': None, 'workspace': None}
+INSTALL = {'run': None}               # 目前/最近一次 ipssm 安裝的 RunState
+ENV_TTL = 60
 
 
 class ApiError(Exception):
@@ -180,24 +185,72 @@ class JobStore:
 #  R 環境狀態
 # ---------------------------------------------------------------------------
 
-def r_status(force=False):
-    """R / ipssm 套件是否可用 (快取 60 秒，因為檢查 ipssm 要啟動 R)。"""
+def env_status(force=False):
+    """完整環境檢查 (ipssm_env.check_environment)。快取 60 秒，因為檢查 ipssm 要實際啟動 R 算一次範例。"""
     now = time.time()
-    if not force and _R_STATUS_CACHE['value'] and now - _R_STATUS_CACHE['at'] < 60:
-        return _R_STATUS_CACHE['value']
-    rscript = P._find_rscript()
-    installed = False
-    if rscript:
-        try:
-            import subprocess
-            r = subprocess.run([rscript, '-e', 'if(!requireNamespace("ipssm",quietly=TRUE)) quit(status=1)'],
-                               capture_output=True, timeout=60)
-            installed = r.returncode == 0
-        except Exception:
-            installed = False
-    value = {'rscript': rscript, 'ipssm_installed': installed, 'ready': bool(rscript and installed)}
-    _R_STATUS_CACHE.update(at=now, value=value)
+    if not force and _ENV_CACHE['value'] and now - _ENV_CACHE['at'] < ENV_TTL:
+        return _ENV_CACHE['value']
+    value = E.check_environment(_ENV_CACHE['workspace'], include_browser=False)
+    _ENV_CACHE.update(at=now, value=value)
     return value
+
+
+def r_status(force=False):
+    """計算所需的 R 環境是否可用 (R 與 ipssm 套件)。"""
+    env = env_status(force)
+    by_id = {c['id']: c for c in env['checks']}
+    installed = by_id['ipssm']['ok']
+    return {'rscript': env['rscript'], 'ipssm_installed': installed, 'ready': bool(env['rscript'] and installed)}
+
+
+def api_install_start():
+    """自動安裝 R 套件 ipssm (使用者在網頁按下按鈕才會執行)。背景執行，可輪詢進度。"""
+    env = env_status(force=True)
+    if not env['rscript']:
+        raise ApiError(409, 'r_missing', '找不到 R，無法自動安裝。請先安裝 R。')
+    if not RUN_LOCK.acquire(blocking=False):
+        raise ApiError(409, 'busy', '目前有另一個工作正在執行，請稍候。')
+    run = RunState('install')
+    INSTALL['run'] = run
+
+    def work():
+        try:
+            ok = E.install_ipssm(env['rscript'], log=lambda line: run.live.write(line + '\n'))
+            run.status = 'done' if ok else 'error'
+            if not ok:
+                run.error = {'code': 'install_failed', 'message': _install_failure_hint(run.live.text())}
+        except Exception as e:
+            run.status, run.error = 'error', {'code': 'install_failed', 'message': f'安裝時發生錯誤：{e}'}
+        finally:
+            _ENV_CACHE['value'] = None
+            RUN_LOCK.release()
+
+    threading.Thread(target=work, daemon=True).start()
+    return {'started': True}
+
+
+def _install_failure_hint(log):
+    """把安裝失敗的原因翻成使用者看得懂的話 (最常見的是連不到網路)。"""
+    low = log.lower()
+    if any(k in low for k in ('could not resolve', 'cannot open url', 'timed out', 'is not available for this version',
+                              'unable to access', 'curl', 'download', 'http error', 'rate limit', 'ssl', 'proxy',
+                              'connection')):
+        return ('安裝失敗，最可能的原因是連不到 GitHub 或 CRAN：網路中斷、被防火牆或代理擋下，'
+                '或 GitHub 暫時限流（HTTP 403，稍後再試即可）。若是離線環境，請改用「離線安裝」(見 README)。'
+                '詳細原因請展開日誌。')
+    if 'not writable' in low or 'permission' in low or '無法寫入' in low:
+        return '安裝失敗：沒有寫入 R 套件資料夾的權限。請展開日誌查看。'
+    if 'compilation failed' in low or 'configuration failed' in low or 'non-zero exit status' in low:
+        return '安裝失敗：套件編譯時出錯，通常是缺少系統函式庫。請展開日誌查看缺少什麼。'
+    return '安裝失敗。請展開日誌查看原因。'
+
+
+def api_install_progress():
+    run = INSTALL['run']
+    if run is None:
+        return {'status': 'idle'}
+    return {'status': run.status, 'log': run.live.text()[-6000:], 'error': run.error,
+            'seconds': int(time.time() - run.started)}
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +282,15 @@ def _inspect(store, job_id, sheet=None, sheet_join=None):
 
 
 def api_status(store, force=False):
-    return {'r': r_status(force), 'workspace': str(store.workspace), 'version': 1,
-            'standard_columns': P.STANDARD_COLUMNS}
+    env = env_status(force)
+    installing = INSTALL['run'] is not None and INSTALL['run'].status == 'running'
+    return {'r': r_status(), 'env': env, 'installing': installing, 'workspace': str(store.workspace),
+            'version': 1, 'terms_version': TERMS_VERSION}
 
 
-def api_upload(store, name, data, max_bytes):
+def api_upload(store, name, data, max_bytes, terms=False):
+    if not terms:
+        raise ApiError(400, 'terms_required', '請先勾選「使用條款與合規確認」才能上傳。')
     name = _clean_filename(name)
     if Path(name).suffix.lower() == '.xls':
         raise ApiError(400, 'legacy_xls', '舊版 .xls 格式不支援，請在 Excel 另存為 .xlsx 後再上傳。')
@@ -244,6 +301,9 @@ def api_upload(store, name, data, max_bytes):
     if len(data) > max_bytes:
         raise ApiError(413, 'too_large', f'檔案超過 {max_bytes // (1024 * 1024)} MB 上限。')
     state = store.create(name, data)
+    state['terms_accepted_at'] = datetime.now().isoformat(timespec='seconds')
+    state['terms_version'] = TERMS_VERSION
+    store.save_state(state['id'], state)
     try:
         inspect = _inspect(store, state['id'])
     except ApiError:
@@ -687,6 +747,8 @@ def api_confirm(store, job_id, body):
         raise ApiError(409, 'r_missing', '找不到 R 或 ipssm 套件，無法計算。請先依畫面上的說明安裝。')
 
     state = store.load_state(job_id)
+    if not state.get('terms_accepted_at'):
+        raise ApiError(400, 'terms_required', '這個工作沒有「使用條款與合規確認」紀錄，請重新上傳並勾選。')
     review = store.load_review(job_id)
     items = _todo_items(review, state.get('acks', {}))
     acked = sum(1 for i in items if i['acked'])
@@ -696,6 +758,7 @@ def api_confirm(store, job_id, body):
         ['核對者', reviewer],
         ['確認時間', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
         ['原始檔案', state['original_name']],
+        ['使用條款確認', f"已確認 (v{state.get('terms_version', TERMS_VERSION)}，{state['terms_accepted_at']})：資料已去識別化；結果僅供學術研究"],
         ['缺失值處理', review['mode'] + (f" (範圍門檻 {review['max_range']})" if review['mode'] == 'auto' else '')],
         ['需核對項目', f'{len(items)} 項，其中已標記確認 {acked} 項、未標記 {len(items) - acked} 項'],
         ['手動修改', f"{len(state.get('edits', []))} 處 (見 Manual_Edits)"],
@@ -833,6 +896,8 @@ def make_handler(store, token, port, max_bytes, shutdown):
         def _route_get(self, path, query):
             if path == '/api/status':
                 return api_status(store, force=query.get('force', ['0'])[0] == '1')
+            if path == '/api/env/install':
+                return api_install_progress()
             m = re.fullmatch(r'/api/jobs/([0-9a-f]{32})(/[a-z-]+(?:/[a-z]+)?)?', path)
             if not m:
                 raise ApiError(404, 'not_found', '找不到')
@@ -876,7 +941,8 @@ def make_handler(store, token, port, max_bytes, shutdown):
                         raise ApiError(413, 'too_large', f'檔案超過 {max_bytes // (1024 * 1024)} MB 上限。')
                     data = self.rfile.read(length)
                     name = urllib.parse.unquote(query.get('name', [''])[0])
-                    self._send(200, api_upload(store, name, data, max_bytes))
+                    terms = query.get('terms', ['0'])[0] == '1'
+                    self._send(200, api_upload(store, name, data, max_bytes, terms))
                     return
                 if length > 1024 * 1024:
                     raise ApiError(413, 'too_large', '請求太大')
@@ -894,6 +960,8 @@ def make_handler(store, token, port, max_bytes, shutdown):
         def _route_post(self, path, body):
             if path == '/api/llm/test':
                 return api_llm_test(body)
+            if path == '/api/env/install':
+                return api_install_start()
             if path == '/api/shutdown':
                 threading.Thread(target=shutdown, daemon=True).start()
                 return {'ok': True}
@@ -938,6 +1006,7 @@ def create_server(workspace=DEFAULT_WORKSPACE, port=8765, max_upload_mb=DEFAULT_
     """建立 (但不啟動) 伺服器。port=0 表示自動挑選；回傳 (server, token, store)。"""
     token = token or secrets.token_urlsafe(24)
     store = JobStore(workspace)
+    _ENV_CACHE.update(at=0.0, value=None, workspace=str(store.workspace))
     last_error = None
     for candidate in ([port] if port == 0 else range(port, port + 20)):
         try:

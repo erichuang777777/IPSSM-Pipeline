@@ -167,3 +167,16 @@ dialog .dlg { padding: 22px 24px; max-height: 80vh; overflow: auto; } dialog .dl
 dialog .dlg dt { font-weight: 700; margin-top: 12px; } dialog .dlg dd { margin: 2px 0 0; color: var(--muted); }
 details { margin: 8px 0; } summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
 .empty { text-align: center; color: var(--muted); padding: 28px 10px; }
+
+/* ---- 環境檢查 / 條款 / 隱藏 ID ---- */
+.envcard.blocked { border-color: var(--warn); }
+.envrow { display: flex; gap: 12px; padding: 7px 0; border-bottom: 1px dashed var(--line); align-items: flex-start; }
+.envrow:last-of-type { border-bottom: none; }
+.envicon { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; font-size: .8rem; flex: none; background: var(--line); color: var(--muted); }
+.envrow.ok .envicon { background: var(--ok-bg); color: var(--ok); } .envrow.bad .envicon { background: var(--bad-bg); color: var(--bad); }
+.envrow.warn .envicon { background: var(--warn-bg); color: var(--warn); }
+.terms ol { margin: 0 0 12px; padding-left: 22px; } .terms li { margin: 3px 0; }
+.terms-ok { padding: 10px 12px; border-radius: 10px; background: var(--primary-soft); cursor: pointer; }
+.dropzone.disabled { opacity: .55; cursor: not-allowed; border-style: solid; }
+.dropzone.disabled:hover { border-color: var(--line); background: var(--card); }
+.btn.active { background: var(--primary-soft); color: var(--primary); }

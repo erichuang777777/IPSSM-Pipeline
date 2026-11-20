@@ -60,6 +60,8 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
 使用完畢請按網頁右上角「**結束程式**」。
 
 **畫面流程**
+0. **環境檢查與條款確認**（首頁）：自動檢查 Python、pandas / openpyxl、R、官方 ipssm 套件是否可用；缺 ipssm 時可按
+   「自動安裝」（需要網路）。上傳前必須勾選「使用條款與合規確認」（伺服器端強制，並記錄在結果檔）。
 1. **選擇檔案**：拖放或點選 Excel / CSV。有多個分頁時由你決定要用哪一頁、如何合併。
 2. **設定與檢查**：確認欄位對應，選擇缺失值怎麼處理（自動判斷 / 全部補平均 / 只算完整），可選用 LLM 輔助。
 3. **核對資料**：待確認清單（資料矛盾、程式替你轉換的格子）、缺失與 UNCERTAIN 的病人與風險區間、被排除的病人、
@@ -73,9 +75,57 @@ bash .claude/skills/ipssm/scripts/run_ipssm.sh <input.csv|xlsx> [--missing auto]
 - 檔案放在工作資料夾（預設 `~/IPSSM_Web_Workspace`，可用 `--workspace` 指定），結果頁可按「清除這次的資料」永久刪除。
 - 關閉分頁或重新整理不會丟失進度：回到網址按「繼續上次的工作」。
 - LLM 的 API key 只存在記憶體，不會寫入檔案；遠端 LLM 必須勾選同意才會使用。
+- 右上角「隱藏病人 ID」：截圖、投影或共用螢幕時，把畫面上的病人 ID 與檔名換成代號（只影響顯示）。
 
 **限制**：一次只處理一個計算工作；供單人在自己的電腦使用，不是多人共用的伺服器（請勿用 `--host` 之類方式對外開放，程式本來也不支援）。
 `start_web.bat` 未在 Windows 上實測（`.sh` 與主程式已在 Linux 上實測）。
+
+## 環境檢查與自動安裝（`ipssm_env.py`）
+
+這台電腦能不能執行？缺什麼？怎麼補？網頁介面、Claude skill / agent 與命令列共用同一份檢查：
+
+```bash
+python3 ipssm_env.py                  # 人類可讀的檢查報告（全部就緒 exit 0，否則 exit 1）
+python3 ipssm_env.py --json           # 機器可讀
+python3 ipssm_env.py --install-ipssm  # 自動安裝 R 套件 ipssm（需要網路，首次約數分鐘）
+python3 ipssm_env.py --install-ipssm --ipssm-source <ipssm 原始碼資料夾>   # 離線安裝
+```
+
+| 檢查項目 | 必要 | 判斷方式 |
+|---|---|---|
+| Python ≥ 3.8 | ✅ | 版本 |
+| pandas ≥ 2.0、openpyxl ≥ 3.1 | ✅ | 版本，且必須能實際載入（與 `requirements.txt` 同步，有測試比對） |
+| R | ✅ | 找得到 `Rscript` 且能執行；低於 4.3 只給**警告**（ipssm 套件本身沒有宣告最低 R 版本，4.3 是本專案測試的版本） |
+| R 套件 ipssm | ✅ | **用套件內附的範例資料實際算一次**，不是只檢查「套件存在」 |
+| 工作資料夾 | ✅ | 可寫入、剩餘空間（檢查本身不會建立任何資料夾） |
+| 預設瀏覽器 | 選用 | 找不到只會提示手動開啟網址 |
+
+為什麼用「實際計算」判斷 ipssm：它的相依套件（`car`、`readxl`）在**計算時才會被用到**，載入套件時不會檢查，所以
+`library(ipssm)` 成功不代表真的能算。檢查會分辨三種失敗並給不同說明：`尚未安裝`、`已安裝，但缺少相依套件：…`、
+`已安裝但無法完成範例計算`。
+
+`install.R` 會選一個**可寫入**的位置安裝（系統資料夾沒有權限時改用使用者自己的 R 資料夾，不需要管理員權限），
+並補齊 ipssm 宣告的相依套件。尚無法在所有環境驗證的部分：實際從 GitHub / CRAN 下載（取決於你的網路；
+GitHub 對未登入請求有限流，遇到 HTTP 403 稍後再試或改離線安裝）。
+
+## 用 Claude Code 引導使用者（skill 與 agent）
+
+專案內附兩個給 Claude Code 使用的檔案，讓 Claude 帶不熟悉終端機的人用網頁處理**自己電腦上**的檔案：
+
+| 檔案 | 角色 | 做什麼 |
+|---|---|---|
+| `.claude/skills/ipssm-web/SKILL.md` | **互動式引導**（在主對話中使用） | 先檢查環境、缺什麼就帶使用者補齊（安裝前先徵求同意）、啟動網頁、陪使用者走完四個畫面並解釋每個選項、疑難排解 |
+| `.claude/agents/ipssm-web-guide.md` | **被委派的執行與診斷員** | 檢查環境、（經授權）補齊、啟動網頁並回報網址、診斷失敗的工作；以結構化報告交回 |
+
+用法：在專案資料夾開 Claude Code，說「我想用網頁處理我的 Excel」即可（會自動套用 skill）。
+兩者分工的原因：Claude Code 的 subagent **無法在執行中向使用者提問**，所以需要和使用者來回確認的部分放在 skill，
+agent 只負責「做事與回報」，需要使用者決定的事會列在報告裡由主對話轉達。
+
+**隱私與安全規則**（寫在兩個檔案裡，並有測試防止被誤刪）：不讀取或複述病患資料、只在本機執行且不對外開放、
+不替使用者做醫學或資料判斷、不替使用者勾選核對確認、會改動電腦的動作（安裝套件）需明確授權，
+agent 刻意**沒有寫入檔案的工具**。這些文件與實際程式的一致性（引用的檔案、旗標、網址擷取方式）也有測試把關。
+
+指令列使用者請改用 `ipssm` skill（`.claude/skills/ipssm/SKILL.md`）。
 
 ## 讀取原始 Excel（多分頁）
 
@@ -268,13 +318,17 @@ pytest -q          # 含 R 端對端測試；找不到 Rscript / ipssm 時會自
 ## 環境需求
 
 - **Python** ≥ 3.8（需安裝 `pandas`, `openpyxl`；測試另需 `pytest`）
-- **R** ≥ 4.3.0（需安裝 `ipssm` 套件，可執行 `Rscript install.R` 安裝）
+- **R**（建議 4.3 以上，本專案以此版本測試；`ipssm` 套件本身沒有宣告最低版本）與官方 `ipssm` 套件（`python3 ipssm_env.py --install-ipssm` 或 `Rscript install.R` 安裝）。可用 `python3 ipssm_env.py` 一次檢查全部條件
 - Rscript 路徑可用環境變數 `IPSSM_RSCRIPT` 覆寫（跨平台自動偵測）
 
 ## 專案結構
 
 ```
 ├── ipssm_web.py + web/        # 本地網頁介面 (後端 + 前端，無外部依賴)
+├── ipssm_env.py               # 環境檢查與 ipssm 自動安裝 (只用標準函式庫)
+├── install.R                  # 安裝 R 套件 ipssm (可寫入位置、補齊相依、支援離線來源)
+├── .claude/skills/ipssm-web/  # 引導使用者用網頁處理本機檔案 (互動式)
+├── .claude/agents/            # ipssm-web-guide: 執行與診斷員
 ├── start_web.bat / .command / .sh   # 雙擊啟動網頁介面
 ├── ipssm_pipeline.py          # 核心腳本 (含 Screener + Cohort Converter + Karyotype Parser + R Translator)
 ├── .claude/skills/ipssm/      # 本地 Claude Code agent skill (SKILL.md + run_ipssm.sh)
@@ -282,7 +336,6 @@ pytest -q          # 含 R 端對端測試；找不到 Rscript / ipssm 時會自
 ├── SCREENER_REFERENCE.md      # Screener 完整參考手冊（欄位規格、函數說明）
 ├── README.md                  # 本文件
 │
-├── install.R                  # 本地安裝 ipssm R 套件
 ├── requirements.txt           # Python 依賴
 ├── .gitignore                 # Git 忽略規則
 │

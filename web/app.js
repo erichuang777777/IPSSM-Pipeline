@@ -83,6 +83,7 @@ const S = {
     llm: { enabled: false, provider: 'openai', endpoint: 'http://localhost:11434/v1', model: '', api_key: '',
            min_confidence: 0.8, allow_remote: false },
   },
+  terms: false, maskIds: store.get('ipssm_mask') === '1', install: null, showInstallLog: false, envOpen: false,
   llmTest: null, reviewer: store.get('ipssm_reviewer') || '', confirmed: false, scroll: {},
 };
 let pollTimer = null;
@@ -121,19 +122,73 @@ function copyButton(text, label) {
   } }, label || '複製');
 }
 
-function rStatusBanner() {
-  const r = S.status && S.status.r;
-  if (!r || r.ready) return null;
-  const cmd = 'install.packages("remotes"); remotes::install_github("papaemmelab/ipssm")';
-  return el('div', { class: 'callout warn' },
-    el('strong', { class: 't' }, r.rscript ? '已找到 R，但還沒有安裝 ipssm 套件' : '找不到 R'),
-    el('p', {}, r.rscript
-      ? '計算需要官方的 ipssm 套件，只需安裝一次。開啟 R（或 RStudio），貼上下面這行並執行（需要網路）：'
-      : '計算需要 R（4.3 版以上）與官方 ipssm 套件，兩者都只需安裝一次。請先到 R 官方網站 cran.r-project.org 下載安裝 R，再開啟 R（或 RStudio），貼上下面這行並執行（需要網路）：'),
-    el('div', { class: 'row' }, el('code', { class: 'mono' }, cmd), copyButton(cmd)),
-    el('p', { class: 'small muted', style: 'margin-top:8px' }, '安裝完成後按「重新檢查」。在此之前仍可上傳與整理資料，但無法試算與計算。'),
-    el('button', { class: 'btn btn-sm', type: 'button', onclick: refreshStatus }, '重新檢查'));
+// ---- 環境檢查 (Python / R / ipssm) 與自動安裝 ----
+const CHECK_ICON = (c) => (c.ok ? (c.warn ? '!' : '✓') : (c.required ? '✗' : '·'));
+
+function envPanel(opts) {
+  const env = S.status && S.status.env;
+  if (!env) return null;
+  const installing = S.install && S.install.status === 'running';
+  const problems = env.checks.filter((c) => (c.required && !c.ok) || (c.ok && c.warn));
+  const blocked = env.checks.some((c) => c.required && !c.ok);
+  if (!blocked && !installing && !(S.install && S.install.status === 'error') && opts && opts.compact) return null;
+
+  const row = (c) => el('div', { class: 'envrow' + (c.ok ? (c.warn ? ' warn' : ' ok') : (c.required ? ' bad' : '')) },
+    el('span', { class: 'envicon', 'aria-hidden': 'true' }, CHECK_ICON(c)),
+    el('div', {}, el('strong', {}, c.label, c.required ? '' : '（選用）'), el('div', { class: 'small muted' }, c.detail),
+      c.fix && (!c.ok || c.warn) ? el('div', { class: 'small', style: 'margin-top:2px' }, '→ ', c.fix) : null));
+
+  const ipssmCheck = env.checks.find((c) => c.id === 'ipssm');
+  const canInstall = env.rscript && ipssmCheck && !ipssmCheck.ok;
+  const installUi = installing ? el('div', { class: 'row', style: 'margin-top:12px' }, el('div', { class: 'spinner' }),
+      el('span', {}, `安裝中… 已 ${S.install.seconds || 0} 秒。首次安裝可能需要數分鐘（需要網路），請不要關閉這個分頁。`)) :
+    canInstall ? el('div', { class: 'row', style: 'margin-top:12px' },
+      el('button', { class: 'btn btn-primary', type: 'button', onclick: startInstall }, '自動安裝 ipssm（需要網路）'),
+      el('span', { class: 'small muted' }, '會執行專案內的 install.R；安裝位置不需要管理員權限。')) : null;
+  const failed = S.install && S.install.status === 'error' ? el('div', { class: 'callout bad', style: 'margin-top:12px' },
+    el('strong', { class: 't' }, '自動安裝沒有成功'), S.install.error ? S.install.error.message : '') : null;
+  const logBox = S.install && S.install.log ? el('div', {}, el('button', { class: 'btn btn-sm', type: 'button',
+    onclick: () => { S.showInstallLog = !S.showInstallLog; render(); } }, S.showInstallLog ? '隱藏安裝日誌' : '顯示安裝日誌'),
+    S.showInstallLog ? el('pre', { class: 'log' }, S.install.log) : null) : null;
+
+  const body = el('div', {}, env.checks.map(row), installUi, failed, logBox,
+    el('div', { class: 'row', style: 'margin-top:12px' }, el('button', { class: 'btn btn-sm', type: 'button', onclick: refreshStatus }, '重新檢查'),
+      blocked ? el('span', { class: 'small muted' }, '缺少的項目補齊後按「重新檢查」。在此之前仍可上傳檔案，但無法試算與計算。') : null));
+
+  if (!blocked && !problems.length && !installing && !S.envOpen) {
+    return el('div', { class: 'card envcard' }, el('div', { class: 'row' }, el('span', { class: 'pill pill-ok' }, '環境就緒'),
+      el('span', { class: 'small muted' }, 'Python、R 與 ipssm 套件都已確認可以正常計算。'), el('span', { class: 'spacer' }),
+      el('button', { class: 'btn btn-sm', type: 'button', onclick: () => { S.envOpen = true; render(); } }, '查看詳細')));
+  }
+  return el('div', { class: 'card envcard' + (blocked ? ' blocked' : '') },
+    el('h2', {}, blocked ? '需要先補齊一些東西' : '環境檢查'), body);
 }
+
+async function startInstall() {
+  try {
+    await api('POST', '/api/env/install', {});
+    S.install = { status: 'running', seconds: 0, log: '' }; render(); pollInstall();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function pollInstall() {
+  try {
+    S.install = await api('GET', '/api/env/install');
+    if (S.install.status === 'running') { render(); setTimeout(pollInstall, 1000); return; }
+    S.status = await api('GET', '/api/status?force=1');
+    if (S.install.status === 'done') toast('ipssm 安裝完成', 'ok');
+    render();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+// ---- 隱私: 隱藏病人 ID ----
+function pid(id) {
+  if (!S.maskIds || id === undefined || id === null || id === '') return id;
+  let h = 5381;
+  for (const ch of String(id)) h = ((h << 5) + h + ch.codePointAt(0)) >>> 0;
+  return '病人#' + h.toString(36).slice(0, 4).toUpperCase().padStart(4, '0');
+}
+const fname = (n) => (S.maskIds ? '（檔名已隱藏）' : n);
 
 // ---------------------------------------------------------------------------
 //  標頭
@@ -142,9 +197,14 @@ function renderChrome() {
   const cur = SCREEN_STEP[S.screen];
   $('#steps').replaceChildren(...STEPS.map((t, i) => el('li', { class: i < cur ? 'done' : i === cur ? 'now' : '' },
     el('span', { class: 'n' }, i < cur ? '✓' : String(i + 1)), el('span', { class: 't' }, t))));
-  const pill = $('#r-pill'), r = S.status && S.status.r;
-  pill.className = 'pill ' + (!r ? 'pill-muted' : r.ready ? 'pill-ok' : 'pill-warn');
-  pill.textContent = !r ? '檢查 R 環境…' : r.ready ? 'R 與 ipssm 已就緒' : (r.rscript ? '缺少 ipssm 套件' : '找不到 R');
+  const pill = $('#r-pill'), env = S.status && S.status.env;
+  const bad = env && env.checks.filter((c) => c.required && !c.ok);
+  pill.className = 'pill ' + (!env ? 'pill-muted' : bad.length ? 'pill-warn' : 'pill-ok');
+  pill.textContent = !env ? '檢查環境…' : !bad.length ? '環境就緒' : (bad.some((c) => c.id === 'r') ? '找不到 R' : bad.some((c) => c.id === 'ipssm') ? '缺少 ipssm 套件' : '環境未就緒');
+  const mask = $('#btn-mask');
+  mask.setAttribute('aria-pressed', String(S.maskIds));
+  mask.textContent = S.maskIds ? '顯示病人 ID' : '隱藏病人 ID';
+  mask.classList.toggle('active', S.maskIds);
 }
 
 async function refreshStatus() {
@@ -156,19 +216,30 @@ async function refreshStatus() {
 //  1. 上傳
 // ---------------------------------------------------------------------------
 function screenUpload() {
-  const input = el('input', { type: 'file', accept: '.xlsx,.xlsm,.csv,.tsv', hidden: true, onchange: (e) => e.target.files[0] && uploadFile(e.target.files[0]) });
-  const dz = el('div', { class: 'dropzone', tabindex: '0', role: 'button', 'aria-label': '選擇或拖放檔案',
-    onclick: () => input.click(), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } },
-    ondragover: (e) => { e.preventDefault(); dz.classList.add('over'); }, ondragleave: () => dz.classList.remove('over'),
-    ondrop: (e) => { e.preventDefault(); dz.classList.remove('over'); if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]); } },
-    el('div', { class: 'big' }, S.busy === 'upload' ? '上傳並讀取中…' : '把檔案拖到這裡，或點一下選擇'),
+  const pick = (f) => { if (S.terms && f) uploadFile(f); };
+  const input = el('input', { type: 'file', accept: '.xlsx,.xlsm,.csv,.tsv', hidden: true, onchange: (e) => pick(e.target.files[0]) });
+  const dz = el('div', { class: 'dropzone' + (S.terms ? '' : ' disabled'), tabindex: S.terms ? '0' : '-1', role: 'button',
+    'aria-disabled': String(!S.terms), 'aria-label': '選擇或拖放檔案',
+    onclick: () => S.terms && input.click(), onkeydown: (e) => { if (S.terms && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); input.click(); } },
+    ondragover: (e) => { e.preventDefault(); if (S.terms) dz.classList.add('over'); }, ondragleave: () => dz.classList.remove('over'),
+    ondrop: (e) => { e.preventDefault(); dz.classList.remove('over'); pick(e.dataTransfer.files[0]); } },
+    el('div', { class: 'big' }, S.busy === 'upload' ? '上傳並讀取中…' : S.terms ? '把檔案拖到這裡，或點一下選擇' : '請先勾選上方的使用條款確認'),
     el('div', { class: 'muted' }, '支援 Excel（.xlsx）與 CSV。可以直接用醫院匯出的原始檔，有多個分頁也沒關係。'), input);
+
+  const terms = el('div', { class: 'card terms' }, el('h2', {}, '使用條款與合規確認'),
+    el('p', { class: 'muted' }, '依 MSKCC 官方 IPSS-M 使用條款，使用前請確認：'),
+    el('ol', {}, el('li', {}, '資料已去識別化，不含姓名、身分證字號等足以辨識個人的資訊 (PHI)。'),
+      el('li', {}, '計算結果僅供學術研究參考，不得用於臨床診斷、治療決策或醫療報告。'),
+      el('li', {}, '不得用於商業用途，除非已取得 MSK 的書面授權。'),
+      el('li', {}, '若要以結果發表論文，事前須先取得授權（聯絡 papaemme@mskcc.org）。')),
+    el('label', { class: 'row terms-ok' }, el('input', { type: 'checkbox', checked: S.terms, onchange: (e) => { S.terms = e.target.checked; render(); } }),
+      el('strong', {}, '我同意接受上述條款，並確認我要上傳的資料符合要求。')));
 
   const resume = store.get('ipssm_job');
   return el('div', {},
     el('div', { class: 'hero' }, el('h1', {}, '把病患資料變成 IPSS-M 風險分數'),
       el('p', {}, '上傳檔案後，程式會幫你整理格式、找出缺漏與矛盾，讓你核對確認後才計算。全程在這台電腦上進行。')),
-    rStatusBanner(), dz,
+    envPanel(), terms, dz,
     resume && !S.busy ? el('div', { class: 'row', style: 'justify-content:center;margin-top:14px' },
       el('button', { class: 'btn', type: 'button', onclick: () => resumeJob(resume) }, '繼續上次的工作')) : null,
     el('ol', { class: 'how' },
@@ -184,7 +255,7 @@ function screenUpload() {
 async function uploadFile(file) {
   S.busy = 'upload'; render();
   try {
-    const res = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {
+    const res = await fetch('/api/upload?terms=1&name=' + encodeURIComponent(file.name), {
       method: 'POST', credentials: 'same-origin', body: file,
       headers: { 'X-IPSSM-Request': '1', 'Content-Type': 'application/octet-stream' } });
     const data = await res.json();
@@ -306,9 +377,9 @@ function screenSettings() {
     el('input', { type: 'radio', name: 'mode', checked: O.missing === k, onchange: () => { O.missing = k; render(); } }),
     el('span', { class: 't' }, t, k === 'auto' ? el('span', { class: 'pill pill-info tag' }, '建議') : null), el('span', { class: 'd' }, d)));
   return el('div', {}, el('h1', {}, '設定與檢查'),
-    rStatusBanner(),
+    envPanel({ compact: true }),
     el('div', { class: 'card' }, el('h2', {}, el('span', { class: 'num' }, '1'), '你的檔案'),
-      el('div', { class: 'row' }, el('strong', {}, S.job.original_name), el('span', { class: 'muted' }, fmtSize(S.job.size)), el('span', { class: 'spacer' }),
+      el('div', { class: 'row' }, el('strong', {}, fname(S.job.original_name)), el('span', { class: 'muted' }, fmtSize(S.job.size)), el('span', { class: 'spacer' }),
         el('button', { class: 'btn btn-sm', type: 'button', onclick: () => { S.job = null; go('upload'); } }, '換一個檔案'))),
     sheetCard(), mappingCard(),
     el('div', { class: 'card' }, el('h2', {}, el('span', { class: 'num' }, '4'), '資料有缺漏時怎麼辦？'),
@@ -417,10 +488,10 @@ function itemCard(it) {
   const jump = () => { S.tab = 'data'; S.rowsQ = { q: it.patient, flagged: false, offset: 0 }; S.highlight = { patient: it.patient, column: it.column || (it.fields || '').split(',')[0].trim() };
     loadRows().then(render); };
   const body = it.kind === 'cell' ? [
-    el('div', {}, el('strong', {}, it.patient), ' 的 ', el('strong', {}, it.column)),
+    el('div', {}, el('strong', {}, pid(it.patient)), ' 的 ', el('strong', {}, it.column)),
     el('div', {}, el('span', { class: 'val' }, it.original || '（空白）'), el('span', { class: 'arrow' }, '→'), el('span', { class: 'val' }, it.normalized)),
     el('div', { class: 'small muted' }, (RULE_TEXT[it.rule] || it.rule), it.source === 'llm' ? ` · LLM 判讀，信心 ${it.confidence}` : '', it.note ? ` · ${it.note}` : '')] : [
-    el('div', {}, el('strong', {}, it.patient), '：', it.message),
+    el('div', {}, el('strong', {}, pid(it.patient)), '：', it.message),
     el('div', { class: 'small muted' }, `${it.kind === 'conflict' ? '資料矛盾' : '提示'} ${it.rule} · 相關欄位：${it.fields}`)];
   return el('div', { class: `item ${it.kind}${it.acked ? ' acked' : ''}` }, el('div', { class: 'body' }, body),
     el('div', { class: 'acts' }, el('button', { class: 'btn btn-sm', type: 'button', onclick: jump }, '到資料表修改'),
@@ -465,7 +536,7 @@ function uncertainTab(R) {
     ' 區間圖：淺色是 Best 到 Worst，深色小條是 Mean（採用的分數）。'),
     el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['病人', '缺失欄位', '單獨就會 UNCERTAIN 的缺失', 'Best#', 'Mean#', 'Worst#', '範圍#', '', '判定'].map(TH))),
       el('tbody', {}, rows.map((m) => el('tr', { class: m.Confidence_Level === 'UNCERTAIN' ? 'bad' : '' },
-        el('td', {}, m.ID), el('td', { class: 'wrap' }, m.Missing_Fields), el('td', { class: 'wrap' }, m.Key_Missing_Fields === 'NONE' ? '—' : m.Key_Missing_Fields),
+        el('td', {}, pid(m.ID)), el('td', { class: 'wrap' }, m.Missing_Fields), el('td', { class: 'wrap' }, m.Key_Missing_Fields === 'NONE' ? '—' : m.Key_Missing_Fields),
         el('td', { class: 'num' }, m.IPSSMscore_best || '—'), el('td', { class: 'num' }, m.IPSSMscore_mean || '—'), el('td', { class: 'num' }, m.IPSSMscore_worst || '—'),
         el('td', { class: 'num' }, m.Range_Score || '—'), el('td', {}, interval(m.IPSSMscore_best, m.IPSSMscore_mean, m.IPSSMscore_worst)),
         el('td', {}, m.Decision === 'INCLUDE' ? (m.Confidence_Level === 'UNCERTAIN' ? el('span', { class: 'pill pill-warn' }, '計算（標示 UNCERTAIN）') : el('span', { class: 'pill pill-ok' }, '計算（可信）'))
@@ -475,7 +546,7 @@ function uncertainTab(R) {
 function excludedTab(R) {
   if (!R.excluded.length) return el('div', { class: 'empty' }, '沒有病人被排除。');
   return el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['病人', '原因類型', '說明'].map(TH))),
-    el('tbody', {}, R.excluded.map((x) => el('tr', {}, el('td', {}, x.ID), el('td', {}, EXCL_TEXT[x.Source] || x.Source), el('td', { class: 'wrap' }, x.Reason))))));
+    el('tbody', {}, R.excluded.map((x) => el('tr', {}, el('td', {}, pid(x.ID)), el('td', {}, EXCL_TEXT[x.Source] || x.Source), el('td', { class: 'wrap' }, x.Reason))))));
 }
 
 function auditTab(R) {
@@ -483,7 +554,7 @@ function auditTab(R) {
   const types = [['needs_review', '需確認'], ['all', '全部'], ['unresolved', '無法解析']];
   return el('div', {}, el('p', { class: 'muted' }, '程式對每個儲存格做過的格式整理（空白的統一標記為缺失這類例行動作不在「需確認」裡）。完整紀錄也可在最後下載。'),
     R.edits.length ? el('div', { class: 'callout ok' }, el('strong', { class: 't' }, `你手動修改了 ${R.edits.length} 處`),
-      R.edits.slice(-8).map((e) => el('div', { class: 'small' }, `${e.time.replace('T', ' ')}　${e.patient} · ${e.column}：`, el('span', { class: 'val' }, e.old), '→', el('span', { class: 'val' }, e.new)))) : null,
+      R.edits.slice(-8).map((e) => el('div', { class: 'small' }, `${e.time.replace('T', ' ')}　${pid(e.patient)} · ${e.column}：`, el('span', { class: 'val' }, e.old), '→', el('span', { class: 'val' }, e.new)))) : null,
     un.length ? el('div', { class: 'callout bad' }, `有 ${un.length} 個儲存格規則（及 LLM）都無法解析，對應的病人已被排除。見「被排除的病人」。`) : null,
     el('div', { class: 'row', style: 'margin-bottom:8px' }, types.map(([k, t]) => el('button', { class: 'btn btn-sm' + (S.auditFilter === k ? ' btn-primary' : ''), type: 'button', onclick: async () => { S.auditFilter = k; S.auditShown = 200; await loadAudit(); render(); } }, t))),
     S.audit ? auditTable() : el('div', { class: 'empty' }, '載入中…'));
@@ -496,7 +567,7 @@ function auditTable() {
   const d = S.audit;
   if (!d.rows.length) return el('div', { class: 'empty' }, '沒有符合的紀錄。');
   return el('div', {}, el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['位置', '病人', '欄位', '原值', '改成', '原因', '來源', '狀態'].map(TH))),
-    el('tbody', {}, d.rows.slice(0, S.auditShown).map((e) => el('tr', {}, el('td', {}, e.Row), el('td', {}, e.ID), el('td', {}, e.Column), el('td', { class: 'mono' }, e.Original || '（空白）'),
+    el('tbody', {}, d.rows.slice(0, S.auditShown).map((e) => el('tr', {}, el('td', {}, e.Row), el('td', {}, pid(e.ID)), el('td', {}, e.Column), el('td', { class: 'mono' }, e.Original || '（空白）'),
       el('td', { class: 'mono' }, e.Normalized), el('td', { class: 'wrap' }, RULE_TEXT[e.Rule] || e.Rule), el('td', {}, e.Source), el('td', {}, e.Status)))))),
     d.rows.length > S.auditShown ? el('div', { class: 'row', style: 'margin-top:8px' }, el('span', { class: 'muted' }, `顯示 ${S.auditShown} / ${d.rows.length} 筆`),
       el('button', { class: 'btn btn-sm', type: 'button', onclick: () => { S.auditShown += 500; render(); } }, '顯示更多')) : null);
@@ -521,7 +592,7 @@ function dataTab() {
   const flagCls = (r) => (r.flags.length ? 'bad' : (r.missing.length || Object.values(r.cells).some((c) => c.status === 'needs_review')) ? 'flag' : '');
   const body = d.rows.map((r) => el('tr', { class: flagCls(r) }, d.columns.map((col) => {
     const v = r.values[col], info = r.cells[col], na = v === 'NA';
-    if (col === 'ID') return el('td', { title: r.flags.length ? '有矛盾：' + r.flags.join(', ') : '' }, v);
+    if (col === 'ID') return el('td', { title: r.flags.length ? '有矛盾：' + r.flags.join(', ') : '' }, pid(v));
     const cls = ['cell', na ? 'na' : '', na && r.missing.includes(col) ? 'missing' : '', info && info.status === 'needs_review' ? 'review' : '', info && info.status === 'user_edited' ? 'edited' : ''].join(' ');
     const td = el('td', { class: cls, tabindex: '0', title: info ? `原值「${info.original || '空白'}」· ${RULE_TEXT[info.rule] || info.rule}` : '點一下可修改', dataset: { patient: r.values.ID, col },
       onclick: () => editCell(td, r, col), onkeydown: (e) => { if (e.key === 'Enter') editCell(td, r, col); } }, v);
@@ -543,7 +614,7 @@ function dataTab() {
 function editCell(td, row, col) {
   if (td.querySelector('input')) return;
   const old = row.values[col];
-  const input = el('input', { type: 'text', value: old, 'aria-label': `${row.values.ID} 的 ${col}` });
+  const input = el('input', { type: 'text', value: old, 'aria-label': `${pid(row.values.ID)} 的 ${col}` });
   let done = false;
   const finish = async (commit) => {
     if (done) return; done = true;
@@ -551,7 +622,7 @@ function editCell(td, row, col) {
     if (!commit || val === old) { render(); return; }
     try {
       const r = await api('POST', `/api/jobs/${S.job.id}/edit`, { row: row.idx, column: col, value: val });
-      if (r.changed) toast(`已修改 ${row.values.ID} 的 ${col}：${r.old} → ${r.value}`, 'ok');
+      if (r.changed) toast(`已修改 ${pid(row.values.ID)} 的 ${col}：${r.old} → ${r.value}`, 'ok');
       S.scroll = saveScroll(); await loadJob(); await loadRows(); render(); restoreScroll();
     } catch (e) { toast(e.message, 'bad'); done = false; input.focus(); input.select(); }
   };
@@ -616,14 +687,14 @@ function screenResults() {
       el('p', { class: 'small muted', style: 'margin-top:10px' }, '結果檔含：Summary（分數與信心）、R_Full_Output（完整數據）、Review_SignOff（核對記錄）、Manual_Edits（你的手動修改）' + (D.uncertain_excluded.length ? '、Uncertain_Excluded（未計算者的風險區間）' : '') + '。')),
     el('div', { class: 'row', style: 'margin-bottom:8px' }, filt.map(([k, t]) => el('button', { class: 'btn btn-sm' + (S.resFilter === k ? ' btn-primary' : ''), type: 'button', onclick: () => { S.resFilter = k; render(); } }, t))),
     el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['病人', '分數 (Mean)#', '風險分類', '信心', 'Best–Worst#', '', '缺失欄位', '矛盾旗標'].map(TH))),
-      el('tbody', {}, shown.map((r) => el('tr', { class: r.Confidence_Level === 'UNCERTAIN' ? 'bad' : '' }, el('td', {}, r.ID), el('td', { class: 'num' }, r.Reported_Score),
+      el('tbody', {}, shown.map((r) => el('tr', { class: r.Confidence_Level === 'UNCERTAIN' ? 'bad' : '' }, el('td', {}, pid(r.ID)), el('td', { class: 'num' }, r.Reported_Score),
         el('td', {}, el('span', { class: 'risk ' + riskClass(r.Reported_Cat) }, r.Reported_Cat)),
         el('td', {}, r.Confidence_Level === 'UNCERTAIN' ? el('span', { class: 'pill pill-warn' }, 'UNCERTAIN') : el('span', { class: 'pill pill-ok' }, 'CONFIDENT')),
         el('td', { class: 'num' }, `${r.IPSSMscore_best} ~ ${r.IPSSMscore_worst}`), el('td', {}, interval(r.IPSSMscore_best, r.Reported_Score, r.IPSSMscore_worst)),
         el('td', { class: 'wrap' }, r.Missing_Fields === 'NONE' ? '' : r.Missing_Fields), el('td', {}, r.Consistency_Flags === 'NONE' ? '' : r.Consistency_Flags)))))),
     D.uncertain_excluded.length ? el('details', { style: 'margin-top:16px' }, el('summary', {}, `因缺失造成範圍過大而未計算的病人（${D.uncertain_excluded.length}）`),
       el('div', { class: 'table-wrap' }, el('table', {}, el('thead', {}, el('tr', {}, ['病人', '缺失欄位', 'Best#', 'Mean#', 'Worst#', '範圍#'].map(TH))),
-        el('tbody', {}, D.uncertain_excluded.map((u) => el('tr', {}, el('td', {}, u.ID), el('td', { class: 'wrap' }, u.Missing_Fields), el('td', { class: 'num' }, u.IPSSMscore_best), el('td', { class: 'num' }, u.IPSSMscore_mean), el('td', { class: 'num' }, u.IPSSMscore_worst), el('td', { class: 'num' }, u.Range_Score))))))) : null,
+        el('tbody', {}, D.uncertain_excluded.map((u) => el('tr', {}, el('td', {}, pid(u.ID)), el('td', { class: 'wrap' }, u.Missing_Fields), el('td', { class: 'num' }, u.IPSSMscore_best), el('td', { class: 'num' }, u.IPSSMscore_mean), el('td', { class: 'num' }, u.IPSSMscore_worst), el('td', { class: 'num' }, u.Range_Score))))))) : null,
     el('div', { class: 'row', style: 'margin-top:22px' },
       el('button', { class: 'btn', type: 'button', onclick: () => { S.confirmed = false; go('review'); } }, '回到核對頁'),
       el('button', { class: 'btn', type: 'button', onclick: () => { S.job = null; store.set('ipssm_job', null); go('upload'); } }, '處理另一份檔案'),
@@ -658,6 +729,7 @@ function render() {
 }
 
 $('#btn-help').addEventListener('click', glossary);
+$('#btn-mask').addEventListener('click', () => { S.maskIds = !S.maskIds; store.set('ipssm_mask', S.maskIds ? '1' : '0'); render(); });
 $('#btn-quit').addEventListener('click', () => dialog('結束程式？', el('p', {}, '會關閉這個本機服務。你的檔案與結果仍保留在工作資料夾，下次開啟可以「繼續上次的工作」。'),
   [{ label: '取消' }, { label: '結束程式', danger: true, onclick: async () => {
     try { await api('POST', '/api/shutdown', {}); } catch (e) { /* 伺服器已關閉 */ }

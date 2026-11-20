@@ -19,7 +19,6 @@ import argparse
 import csv
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +30,7 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
 from ipssm_checks import CONSISTENCY_RULES, check_consistency, flag_ids
+from ipssm_env import find_rscript, r_subprocess_env
 from ipssm_source import (
     META_COLUMNS, META_ROW, META_SHEET, SHEET_JOINS, SourceSelectionError,
     describe_source, load_table,
@@ -1264,28 +1264,8 @@ def run_screening(input_path, output_path, log_path, missing_mode=DEFAULT_MISSIN
 # ============================================================================
 
 def _find_rscript():
-    """自動尋找 Rscript 路徑 (跨平台: 環境變數 > PATH > 常見安裝路徑)"""
-    # 1. 明確覆寫 (最高優先)
-    override = os.environ.get('IPSSM_RSCRIPT')
-    if override and Path(override).exists():
-        return override
-
-    # 2. PATH 搜尋 (posix 與 Windows 皆適用)
-    for name in ('Rscript', 'Rscript.exe'):
-        found = shutil.which(name)
-        if found:
-            return found
-
-    # 3. 常見 Windows 安裝路徑後備
-    candidates = [
-        r"C:\Program Files\R\R-4.5.2\bin\Rscript.exe",
-        r"C:\Program Files\R\R-4.4.2\bin\Rscript.exe",
-        r"C:\Program Files\R\R-4.3.0\bin\Rscript.exe",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
-    return None
+    """尋找 Rscript (實作在 ipssm_env.find_rscript，與環境檢查共用，避免兩處不一致)。"""
+    return find_rscript()
 
 
 def _read_r_output(csv_path):
@@ -1448,13 +1428,7 @@ def _run_r_scoring(input_csv, rscript, output_csv, error_dir, quiet=False):
 
     try:
         cmd = [rscript, r_script_file, str(input_csv), str(output_csv)]
-        r_env = os.environ.copy()
-        # 只有在使用者沒設定 R_LIBS_USER、且 ~/R/library 存在時才補上，
-        # 避免覆寫 RStudio / 系統預設的 library 路徑。
-        user_lib = os.path.expanduser("~/R/library")
-        if "R_LIBS_USER" not in r_env and os.path.isdir(user_lib):
-            r_env["R_LIBS_USER"] = user_lib
-        result = subprocess.run(cmd, capture_output=True, text=True, env=r_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=r_subprocess_env())
 
         if result.stdout and not quiet:
             print(result.stdout)
