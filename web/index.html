@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPSS-M 批次計算</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <a class="skip" href="#app">跳到主要內容</a>
+
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">M</span>
+        <div>
+          <div class="brand-name">IPSS-M 批次計算</div>
+          <div class="brand-sub">MDS 風險分數 · 在這台電腦上完成，資料不會外傳</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="r-pill" class="pill pill-muted" role="status">檢查環境…</span>
+        <button class="btn btn-ghost" id="btn-mask" type="button" aria-pressed="false" title="截圖或共用螢幕時使用：把畫面上的病人 ID 與檔名換成代號">隱藏病人 ID</button>
+        <button class="btn btn-ghost" id="btn-help" type="button">名詞說明</button>
+        <button class="btn btn-ghost" id="btn-quit" type="button">結束程式</button>
+      </div>
+    </div>
+    <ol class="steps" id="steps" aria-label="進度"></ol>
+  </header>
+
+  <div class="notice-bar" role="note">
+    僅供學術研究參考，<strong>不得用於臨床診斷或治療決策</strong>。請使用已去識別化的資料。
+  </div>
+
+  <main id="app" tabindex="-1"></main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <dialog id="dialog"></dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

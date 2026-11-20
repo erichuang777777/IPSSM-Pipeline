@@ -17,6 +17,17 @@ a `.csv` or `.xlsx` with columns like `ID, HB, PLT, BM_BLAST, ...` and/or a raw
 `karyotype` column, possibly from a hospital cohort (FJUH / HSCT layouts are
 auto-detected).
 
+## Not a terminal user?
+
+If the user prefers a browser to the command line (or says "不想打指令" / "用網頁"), use the **`ipssm-web`
+skill** instead (`.claude/skills/ipssm-web/SKILL.md`): it checks the environment and walks them through the local web UI.
+The environment checker it relies on also works here:
+
+```bash
+python3 ipssm_env.py            # human-readable: Python, pandas/openpyxl, R, ipssm (runs a real sample calculation)
+python3 ipssm_env.py --json     # machine-readable
+```
+
 ## Step 0 — Locate the pipeline
 
 The pipeline lives at the **repo root** as `ipssm_pipeline.py`. Either `cd` to the
